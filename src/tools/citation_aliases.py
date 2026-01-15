@@ -6,11 +6,31 @@ from dataclasses import dataclass
 from .lightrag_kb import KBChunk
 
 
-# Alias tokens look like: [C1], [C12], [KB3] ...
+# Alias tokens look like:
+# - [C1]
+# - [C12]
+# - [C5, C16] (comma/semicolon separated lists are common in LLM outputs)
 # Prefix is one-or-more uppercase letters; suffix is one-or-more digits.
-_ALIAS_TOKEN_RE = re.compile(r"\[(?P<alias>[A-Z]+\d+)\]")
+# Only match bracket groups that *look like* citations, i.e. after optional whitespace the
+# first char is NOT a JSON container starter (`{` or `"`). This avoids accidentally treating
+# JSON arrays like `["recipes": [...]]` as citation brackets and extracting tokens like `M1`/`M2`.
+_BRACKET_RE = re.compile(r"\[\s*(?P<body>(?![{\"])[^\]]+)\]")
+_ALIAS_IN_BRACKET_RE = re.compile(r"(?<![A-Za-z0-9])(?P<alias>[A-Z]+\d+)(?![A-Za-z0-9])")
+
+# Memory tokens:
+# - mem:<uuid> (canonical)
+# - mem:<hex_prefix> (allowed; must be resolved against the run memory registry)
+#
+# NOTE: We must avoid matching the first 8 hex chars of a full UUID (because a UUID has a '-'
+# right after the first 8 chars). The `(?!-)` guard prevents that.
 _MEM_TOKEN_RE = re.compile(
-    r"\bmem:(?P<mem_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+    r"\bmem:(?P<mem_id>"
+    r"(?:"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|"
+    r"[0-9a-fA-F]{8,32}"
+    r")"
+    r")(?!-)\b"
 )
 
 
@@ -60,25 +80,38 @@ def alias_kb_chunks(
 
 
 def extract_citation_aliases(text: str) -> list[str]:
-    """Extract alias tokens like [C1] from LLM output.
+    """Extract KB citation aliases from LLM output.
+
+    Supports both:
+    - single-alias bracket tokens: [C1]
+    - multi-alias bracket tokens: [C5, C16]
 
     Returns aliases in first-seen order, de-duplicated.
     """
     seen: set[str] = set()
     ordered: list[str] = []
-    for m in _ALIAS_TOKEN_RE.finditer(text):
-        alias = m.group("alias")
-        if alias in seen:
+    for m in _BRACKET_RE.finditer(text or ""):
+        body = (m.group("body") or "").strip()
+        if not body:
             continue
-        seen.add(alias)
-        ordered.append(alias)
+        for m2 in _ALIAS_IN_BRACKET_RE.finditer(body):
+            alias = m2.group("alias")
+            if alias in seen:
+                continue
+            seen.add(alias)
+            ordered.append(alias)
     return ordered
 
 
 def extract_memory_ids(text: str) -> list[str]:
-    """Extract memory citations like `mem:<uuid>` from text.
+    """Extract memory citations like `mem:<uuid>` (or `mem:<hex_prefix>`) from text.
 
-    Returns mem_ids in first-seen order, de-duplicated.
+    Returns tokens in first-seen order, de-duplicated.
+    - Full UUID tokens are returned as full UUID strings.
+    - Prefix tokens are returned as the prefix string (hex, without hyphens).
+
+    These tokens must be resolved against the run memory registry before being treated as
+    authoritative mem_ids.
     """
     seen: set[str] = set()
     ordered: list[str] = []

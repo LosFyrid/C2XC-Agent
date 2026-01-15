@@ -10,7 +10,7 @@ max_rounds = 64
 # Safety bound against infinite recursion / bad plans.
 max_depth = 6
 # Safety bound for total loop iterations per run.
-max_steps = 60
+max_steps = 100
 
 [kb]
 # Default retrieval behavior for LightRAG query_data

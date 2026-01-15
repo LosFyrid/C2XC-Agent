@@ -553,6 +553,135 @@ class RecapEngine:
             last_mem_search_ids=[],
         )
 
+        def _resolve_mem_tokens(mem_tokens: list[str]) -> tuple[list[str], list[str], dict[str, list[str]]]:
+            """Resolve mem tokens (full UUIDs or hex prefixes) into full mem_ids in the run registry.
+
+            Returns:
+              - resolved_mem_ids: list[str] full mem_ids (de-duplicated, first-seen order)
+              - invalid_tokens: list[str] tokens that match nothing
+              - ambiguous: dict[prefix] -> list[matching_full_ids]
+            """
+            resolved: list[str] = []
+            seen: set[str] = set()
+            invalid: list[str] = []
+            ambiguous: dict[str, list[str]] = {}
+
+            if not mem_tokens:
+                return resolved, invalid, ambiguous
+
+            known_ids: list[str] = list(rt.mem_id_to_item.keys())
+            known_ids_lower = {mid.lower(): mid for mid in known_ids}
+
+            for tok_raw in mem_tokens:
+                tok = (tok_raw or "").strip()
+                if not tok:
+                    continue
+                tok_norm = tok.lower()
+
+                # Full UUID token path.
+                if "-" in tok_norm:
+                    mid = known_ids_lower.get(tok_norm)
+                    if mid is None:
+                        invalid.append(tok_raw)
+                        continue
+                    if mid not in seen:
+                        seen.add(mid)
+                        resolved.append(mid)
+                    continue
+
+                # Prefix token path (hex without hyphens).
+                matches = [mid for mid in known_ids if mid.lower().startswith(tok_norm)]
+                if not matches:
+                    invalid.append(tok_raw)
+                    continue
+                if len(matches) > 1:
+                    ambiguous[tok_raw] = matches
+                    continue
+                mid = matches[0]
+                if mid not in seen:
+                    seen.add(mid)
+                    resolved.append(mid)
+
+            return resolved, invalid, ambiguous
+
+        def _validate_and_resolve_final_output(
+            obj: dict[str, Any],
+            *,
+            context: str,
+        ) -> tuple[dict[str, str], list[str], list[str], list[str]]:
+            """Validate a final recipes JSON object and resolve citations/memories.
+
+            Returns:
+              - citations: alias -> canonical kb ref (kb:...)
+              - resolved_mem_ids: list[str] full mem_ids cited
+              - used_aliases: list[str] aliases found in output (order-preserving, de-duplicated)
+              - mem_tokens: list[str] mem tokens found in output (UUIDs or prefixes)
+
+            Raises RecapError if validation fails.
+            """
+            recipes = obj.get("recipes")
+            if not isinstance(recipes, list) or len(recipes) != int(ctx.recipes_per_run):
+                raise RecapError(f"Invalid recipe count. Expected exactly {ctx.recipes_per_run}.")
+
+            # Validate per-recipe citation presence (KB alias [C1] or memory mem:<id>).
+            missing_citations = 0
+            for r in recipes:
+                if not isinstance(r, dict):
+                    continue
+                rationale = str(r.get("rationale") or "")
+                if not extract_citation_aliases(rationale) and not extract_memory_ids(rationale):
+                    missing_citations += 1
+            if missing_citations:
+                raise RecapError(
+                    "Each recipe rationale must include at least one inline citation. "
+                    "Use either a KB alias like [C2] or a memory id like mem:<uuid>."
+                )
+
+            text_dump = json.dumps(obj, ensure_ascii=False)
+            used_aliases = extract_citation_aliases(text_dump)
+            mem_tokens = extract_memory_ids(text_dump)
+
+            if not used_aliases and not mem_tokens:
+                raise RecapError("No citations found in final output (KB alias [C#] or mem:<id>).")
+
+            # Resolve KB aliases.
+            try:
+                citations = resolve_aliases(used_aliases, rt.kb_alias_map)
+            except KeyError as e:
+                raise RecapError(
+                    f"Unknown citation alias in output: {e}. "
+                    "Only cite aliases that exist in the run evidence registry (see index / kb_list)."
+                ) from e
+
+            # Resolve + validate memory tokens.
+            resolved_mem_ids, invalid_tokens, ambiguous = _resolve_mem_tokens(mem_tokens)
+            if invalid_tokens:
+                raise RecapError(
+                    "Unknown mem:<id> cited in output. You may only cite mem:<id> values that exist in the run memory "
+                    "registry (use mem_search first). Unknown: "
+                    f"{invalid_tokens}"
+                )
+            if ambiguous:
+                # Avoid dumping huge lists; show only a few candidates per token.
+                preview = {k: v[:5] for k, v in ambiguous.items()}
+                raise RecapError(
+                    "Ambiguous mem:<prefix> cited in output. Use a longer prefix or the full UUID. "
+                    f"Ambiguous: {preview}"
+                )
+
+            archived: list[str] = []
+            for mid in resolved_mem_ids:
+                it = rt.mem_id_to_item.get(mid)
+                if it is not None and it.status != "active":
+                    archived.append(mid)
+            if archived:
+                raise RecapError(
+                    "Archived mem:<id> cited in output. Do not cite archived memories. "
+                    f"Archived: {archived}"
+                )
+
+            return citations, resolved_mem_ids, used_aliases, mem_tokens
+
         while True:
             ctx.check_cancelled()
 
@@ -729,7 +858,30 @@ class RecapEngine:
 
                 # Task done; backtrack to parent (or error if root ends without final generation).
                 if rt.node_ptr.parent is None:
-                    raise RecapError("Root task ended without generate_recipes.")
+                    # Fallback: some models output the final recipes JSON in `result` instead of calling
+                    # generate_recipes. Accept it if it validates; otherwise, keep strict behavior.
+                    try:
+                        parsed_root = extract_first_json_object(info.result)
+                        if not isinstance(parsed_root, dict):
+                            raise RecapError("Root `result` is not a JSON object.")
+                        citations, resolved_mem_ids, used_aliases, mem_tokens = _validate_and_resolve_final_output(
+                            parsed_root,
+                            context="root_fallback",
+                        )
+                        ctx.trace(
+                            "final_output_fallback_used",
+                            {
+                                "ts": _now_ts(),
+                                "agent": rt.node_ptr.role,
+                                "used_aliases": used_aliases,
+                                "resolved_citations": citations,
+                                "mem_tokens": mem_tokens,
+                                "resolved_mem_ids": resolved_mem_ids,
+                            },
+                        )
+                        return parsed_root, citations, resolved_mem_ids
+                    except Exception as e:
+                        raise RecapError("Root task ended without generate_recipes.") from e
 
                 rt.done_task_name = rt.node_ptr.task_name
                 rt.done_task_result = info.result.strip()
@@ -1301,104 +1453,19 @@ class RecapEngine:
                         )
                         continue
 
-                    recipes = parsed.get("recipes")
-                    if not isinstance(recipes, list) or len(recipes) != int(ctx.recipes_per_run):
-                        gen_history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"ERROR: Invalid recipe count. Expected exactly {ctx.recipes_per_run}.\n"
-                                    "Fix the JSON so it contains exactly the required number of recipes."
-                                ),
-                            }
-                        )
-                        continue
-
-                    # Validate per-recipe citation presence (KB alias [C1] or memory mem:<id>).
-                    missing_citations = 0
-                    for r in recipes:
-                        if not isinstance(r, dict):
-                            continue
-                        rationale = str(r.get("rationale") or "")
-                        if not extract_citation_aliases(rationale) and not extract_memory_ids(rationale):
-                            missing_citations += 1
-                    if missing_citations:
-                        gen_history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "ERROR: Each recipe rationale must include at least one inline citation.\n"
-                                    "Use either:\n"
-                                    "- a KB alias like [C2], OR\n"
-                                    "- a memory id like mem:123e4567-e89b-12d3-a456-426614174000\n"
-                                    "Fix the recipes so every rationale includes citations inline."
-                                ),
-                            }
-                        )
-                        continue
-
-                    text_dump = json.dumps(parsed, ensure_ascii=False)
-                    used_aliases = extract_citation_aliases(text_dump)
-                    used_mem_ids = extract_memory_ids(text_dump)
-
-                    if not used_aliases and not used_mem_ids:
-                        gen_history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "ERROR: No citations found in final output.\n"
-                                    "Add at least one valid KB alias like [C2] or memory id like mem:<uuid>."
-                                ),
-                            }
-                        )
-                        continue
-
                     try:
-                        citations = resolve_aliases(used_aliases, rt.kb_alias_map)
-                    except KeyError as e:
-                        gen_history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"ERROR: Unknown citation alias in output: {e}.\n"
-                                    "Only cite aliases that exist in the run evidence registry (see index / kb_list)."
-                                ),
-                            }
+                        citations, resolved_mem_ids, used_aliases, mem_tokens = _validate_and_resolve_final_output(
+                            parsed,
+                            context="generate_recipes.final",
                         )
-                        continue
-
-                    # Validate memory citations: must come from the run memory registry and be active.
-                    invalid_mem: list[str] = []
-                    archived_mem: list[str] = []
-                    for mid in used_mem_ids:
-                        it = rt.mem_id_to_item.get(mid)
-                        if it is None:
-                            invalid_mem.append(mid)
-                            continue
-                        if it.status != "active":
-                            archived_mem.append(mid)
-
-                    if invalid_mem:
+                    except RecapError as e:
                         gen_history.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "ERROR: Unknown mem:<id> cited in output.\n"
-                                    "You may only cite mem:<id> values that exist in the run memory registry "
-                                    "(use mem_search first).\n"
-                                    f"Unknown: {invalid_mem}"
-                                ),
-                            }
-                        )
-                        continue
-                    if archived_mem:
-                        gen_history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "ERROR: Archived mem:<id> cited in output.\n"
-                                    "Do not cite archived memories. Use mem_search to find active alternatives.\n"
-                                    f"Archived: {archived_mem}"
+                                    f"ERROR: {e}\n\n"
+                                    "Fix the JSON so it matches the required schema, and ensure all citations are valid "
+                                    "(existing KB aliases / existing mem:<id> in the run registry)."
                                 ),
                             }
                         )
@@ -1418,7 +1485,8 @@ class RecapEngine:
                         {
                             "ts": _now_ts(),
                             "agent": "orchestrator",
-                            "mem_ids": used_mem_ids,
+                            "mem_tokens": mem_tokens,
+                            "mem_ids": resolved_mem_ids,
                             "resolved": [
                                 {
                                     "mem_id": mid,
@@ -1428,11 +1496,11 @@ class RecapEngine:
                                     if mid in rt.mem_id_to_item
                                     else None,
                                 }
-                                for mid in used_mem_ids
+                                for mid in resolved_mem_ids
                             ],
                         },
                     )
-                    return parsed, citations, used_mem_ids
+                    return parsed, citations, resolved_mem_ids
 
                 raise RecapError("generate_recipes exceeded maximum turns without producing a valid final output.")
 
