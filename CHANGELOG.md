@@ -2,7 +2,23 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
-## Unreleased (Milestone 3: RB Claims V1)
+## v0.2.2 (2026-01-17)
+
+- Fixed: `/api/v1/runs/{run_id}/modifier_checks` no longer crashes due to `sqlite3.Row` lacking `.get()` (PubChem panel 500).
+- Improved: PubChem SMILES parsing now accepts multiple keys (`CanonicalSMILES`/`IsomericSMILES`/`SMILES`/`ConnectivitySMILES`) to avoid missing `canonical_smiles`/`has_cooh`.
+- New: Cache-only API endpoint `GET /api/v1/runs/{run_id}/modifier_checks` (does not trigger PubChem; returns 404 if not computed yet).
+- Changed: WebUI no longer auto-triggers PubChem requests on run page load; it reads cached modifier checks and provides a "Resolve" button for on-demand compute.
+- Improved: Output recipe cards surface `implementation_conditions` and `evidence_summary` for faster review.
+
+## v0.2.1 (2026-01-17)
+
+- Improved: WebUI long-text readability and traceability
+  - Trace/JSON viewer: long string fields are expandable (with a rendered view + copy).
+  - Evidence viewer: evidence chunks render Markdown + safe HTML (e.g. `<sub>/<sup>`) with a Raw fallback view.
+  - JSON Tree: object/array nodes support "Show more"/"Show all" to reveal previously hidden keys/items.
+  - Output: recipe rationales and `overall_notes` render Markdown while preserving clickable citation aliases.
+
+## v0.2 (2026-01-17)
 
 - New: Strict RB memory format `RBMEM_CLAIMS_V1` (key=value header + `CLAIMS_JSON`) stored in `MemoryItem.content`.
 - New: Claim-level epistemic status (`fact|hypothesis|conclusion`) and support/contra counters (item lifecycle remains `active|archived`).

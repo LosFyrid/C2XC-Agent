@@ -124,7 +124,16 @@ def resolve_pubchem(name: str, *, timeout_s: float = 8.0) -> PubChemResolution:
         table = props.get("PropertyTable")
         properties = (table.get("Properties") if isinstance(table, dict) else None) if table is not None else None
         first = properties[0] if isinstance(properties, list) and properties else {}
-        smiles = str(first.get("CanonicalSMILES") or "").strip() or None
+        # PubChem's PUG REST has historically returned different SMILES keys depending on
+        # endpoint behavior / requested property names. Be liberal in what we accept.
+        # We still expose it as `canonical_smiles` in our API contract.
+        smiles_any = (
+            first.get("CanonicalSMILES")
+            or first.get("IsomericSMILES")
+            or first.get("SMILES")
+            or first.get("ConnectivitySMILES")
+        )
+        smiles = str(smiles_any or "").strip() or None
         inchikey = str(first.get("InChIKey") or "").strip() or None
         has_cooh = _has_carboxylic_acid_smiles(smiles) if smiles else None
 
@@ -148,4 +157,3 @@ def resolve_pubchem(name: str, *, timeout_s: float = 8.0) -> PubChemResolution:
             has_cooh=None,
             error=str(e),
         )
-

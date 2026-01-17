@@ -9,17 +9,20 @@ import {
   getRun,
   getRunEvidenceAlias,
   getRunEvent,
+  getRunModifierChecks,
   getRunOutput,
   listRunEvents,
   resolveRunModifierChecks,
 } from '../api/c2xc'
 import type { EventListItem, ModifierCheckItem, RunDetailResponse } from '../api/types'
-import { CitationText } from '../components/CitationText'
+import { CitationMarkdown } from '../components/CitationMarkdown'
 import { FeedbackTab } from '../components/FeedbackTab'
 import { ReasoningBankTab } from '../components/ReasoningBankTab'
 import { useConfirmDialog } from '../components/ConfirmDialog'
 import { DependencyUnavailablePanel } from '../components/DependencyUnavailablePanel'
 import { JsonViewer } from '../components/JsonViewer'
+import { Markdown } from '../components/Markdown'
+import { RichTextViewer } from '../components/RichTextViewer'
 import { TextViewer } from '../components/TextViewer'
 import { useT } from '../i18n/i18n'
 
@@ -209,11 +212,20 @@ export function RunDetailPage() {
     },
   })
 
+  const resolveModifierChecksMutation = useMutation({
+    mutationFn: () => resolveRunModifierChecks(runId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modifierChecks', runId] })
+    },
+  })
+
   const modifierChecksQuery = useQuery({
     queryKey: ['modifierChecks', runId],
-    queryFn: () => resolveRunModifierChecks(runId),
+    // Read cached checks only; user explicitly triggers compute via POST.
+    queryFn: () => getRunModifierChecks(runId),
     enabled: !!runId && Boolean(outputQuery.data),
-    // Don't spam PubChem; cache in react-query. Backend also caches in trace.
+    retry: false,
+    // Cache in react-query; backend also caches in trace.
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   })
@@ -618,6 +630,9 @@ export function RunDetailPage() {
                   modifierChecks={modifierChecksQuery.data?.items ?? []}
                   modifierChecksError={modifierChecksQuery.error as Error | null}
                   modifierChecksLoading={modifierChecksQuery.isLoading}
+                  modifierChecksNotFound={(modifierChecksQuery.error as ApiError | null)?.code === 'not_found'}
+                  modifierChecksResolving={resolveModifierChecksMutation.isPending}
+                  onResolveModifierChecks={() => resolveModifierChecksMutation.mutate()}
                 />
 
                 <CitationsPanel
@@ -724,7 +739,7 @@ export function RunDetailPage() {
                       </div>
                     </div>
 
-                    <TextViewer text={String(evidenceItemQuery.data?.content ?? '')} />
+                    <RichTextViewer text={String(evidenceItemQuery.data?.content ?? '')} />
                   </div>
                 )
               ) : (
@@ -855,6 +870,9 @@ function StructuredRecipes(props: {
   modifierChecks?: ModifierCheckItem[]
   modifierChecksLoading?: boolean
   modifierChecksError?: Error | null
+  modifierChecksNotFound?: boolean
+  modifierChecksResolving?: boolean
+  onResolveModifierChecks?: () => void
 }) {
   const obj = isRecord(props.recipesJson) ? props.recipesJson : {}
   const recipesRaw = obj['recipes']
@@ -875,19 +893,35 @@ function StructuredRecipes(props: {
     <div className="grid gap-3">
       <div className="text-xs font-medium text-muted">recipes</div>
       <div className="grid gap-3 md:grid-cols-2">
-        {recipes.map((item: unknown, idx: number) => {
-          const r = isRecord(item) ? item : {}
-          const m1 = readStringField(r, 'M1') ?? ''
-          const m2 = readStringField(r, 'M2') ?? ''
-          const atomicRatio = readStringField(r, 'atomic_ratio') ?? ''
-          const modifier = readStringField(r, 'small_molecule_modifier') ?? ''
-          const rationale = readStringField(r, 'rationale') ?? ''
-          const check = modifier ? checksByQuery.get(modifier) ?? null : null
+	        {recipes.map((item: unknown, idx: number) => {
+	          const r = isRecord(item) ? item : {}
+	          const m1 = readStringField(r, 'M1') ?? ''
+	          const m2 = readStringField(r, 'M2') ?? ''
+	          const atomicRatio = readStringField(r, 'atomic_ratio') ?? ''
+	          const modifier = readStringField(r, 'small_molecule_modifier') ?? ''
+	          const implRaw = r['implementation_conditions']
+	          const impl = isRecord(implRaw) ? implRaw : null
+	          const implEntries = impl
+	            ? Object.entries(impl).filter(([, v]) => {
+	                return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'
+	              })
+	            : []
+	          const evidenceSummaryRaw = r['evidence_summary']
+	          const evidenceSummary = Array.isArray(evidenceSummaryRaw)
+	            ? (evidenceSummaryRaw
+	                .filter((v): v is string => typeof v === 'string')
+	                .map((v) => v.trim())
+	                .filter(Boolean) as string[])
+	            : []
+	          const rationale = readStringField(r, 'rationale') ?? ''
+	          const check = modifier ? checksByQuery.get(modifier) ?? null : null
+	          const showModifierChecksError = Boolean(props.modifierChecksError) && !props.modifierChecksNotFound
+	          const showResolveButton = Boolean(props.onResolveModifierChecks) && Boolean(modifier) && props.modifierChecksNotFound
 
-          return (
-          <div key={idx} className="rounded-md border border-border bg-surface p-3 text-sm">
-            <div className="flex items-center justify-between">
-              <div className="font-medium">
+	          return (
+	          <div key={idx} className="rounded-md border border-border bg-surface p-3 text-sm">
+	            <div className="flex items-center justify-between">
+	              <div className="font-medium">
                 #{idx + 1} · {m1 || '?'}-{m2 || '?'}
               </div>
             </div>
@@ -902,22 +936,51 @@ function StructuredRecipes(props: {
                 <span className="text-muted">atomic_ratio:</span>{' '}
                 <span className="font-mono">{atomicRatio || '—'}</span>
               </div>
-              <div>
-                <span className="text-muted">small_molecule_modifier:</span>{' '}
-                <span className="font-mono">{modifier || '—'}</span>
-              </div>
-              {modifier ? (
-                <div className="mt-1 rounded-md border border-border bg-bg p-2 text-[11px]">
-                  <div className="mb-1 flex items-center justify-between">
-                    <div className="text-muted">PubChem / COOH check</div>
-                    {props.modifierChecksLoading ? (
-                      <div className="text-muted">loading…</div>
-                    ) : props.modifierChecksError ? (
-                      <div className="text-danger">error</div>
-                    ) : null}
-                  </div>
-                  {check ? (
-                    <div className="grid gap-1">
+	              <div>
+	                <span className="text-muted">small_molecule_modifier:</span>{' '}
+	                <span className="font-mono">{modifier || '—'}</span>
+	              </div>
+	              {implEntries.length ? (
+	                <div className="mt-1 rounded-md border border-border bg-bg p-2 text-[11px]">
+	                  <div className="mb-1 text-muted">implementation_conditions</div>
+	                  <div className="grid gap-1">
+	                    {implEntries.map(([k, v]) => (
+	                      <div key={k}>
+	                        <span className="text-muted">{k}:</span>{' '}
+	                        <span className="font-mono">{String(v)}</span>
+	                      </div>
+	                    ))}
+	                  </div>
+	                </div>
+	              ) : null}
+	              {modifier ? (
+	                <div className="mt-1 rounded-md border border-border bg-bg p-2 text-[11px]">
+	                  <div className="mb-1 flex items-center justify-between">
+	                    <div className="text-muted">PubChem / COOH check</div>
+	                    <div className="flex items-center gap-2">
+	                      {props.modifierChecksResolving ? (
+	                        <div className="text-muted">resolving…</div>
+	                      ) : props.modifierChecksLoading ? (
+	                        <div className="text-muted">loading…</div>
+	                      ) : showModifierChecksError ? (
+	                        <div className="text-danger">error</div>
+	                      ) : props.modifierChecksNotFound ? (
+	                        <div className="text-muted">not computed</div>
+	                      ) : null}
+	                      {showResolveButton ? (
+	                        <button
+	                          type="button"
+	                          onClick={() => props.onResolveModifierChecks?.()}
+	                          disabled={props.modifierChecksResolving}
+	                          className="rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-fg hover:border-accent disabled:opacity-50"
+	                        >
+	                          Resolve
+	                        </button>
+	                      ) : null}
+	                    </div>
+	                  </div>
+	                  {check ? (
+	                    <div className="grid gap-1">
                       <div>
                         <span className="text-muted">status:</span>{' '}
                         <span className="font-mono">{check.status}</span>
@@ -952,19 +1015,32 @@ function StructuredRecipes(props: {
                         <div className="text-muted">
                           <span className="text-muted">note:</span> {check.error}
                         </div>
-                      ) : null}
-                    </div>
-                  ) : props.modifierChecksLoading ? (
-                    <div className="text-muted">Loading modifier checks…</div>
-                  ) : (
-                    <div className="text-muted">No modifier check result.</div>
-                  )}
-                </div>
-              ) : null}
-            </div>
-            {rationale ? (
-              <div className="mt-3 text-xs text-fg">
-                <CitationText
+	                      ) : null}
+	                    </div>
+	                  ) : props.modifierChecksLoading || props.modifierChecksResolving ? (
+	                    <div className="text-muted">Loading modifier checks…</div>
+	                  ) : props.modifierChecksNotFound ? (
+	                    <div className="text-muted">Not computed yet. Click Resolve.</div>
+	                  ) : (
+	                    <div className="text-muted">No modifier check result.</div>
+	                  )}
+	                </div>
+	              ) : null}
+	              {evidenceSummary.length ? (
+	                <div className="mt-1 rounded-md border border-border bg-bg p-2 text-[11px]">
+	                  <div className="mb-1 text-muted">evidence_summary</div>
+	                  <CitationMarkdown
+	                    text={evidenceSummary.map((line) => `- ${line}`).join('\n')}
+	                    knownAliases={props.citationAliases}
+	                    onClickAlias={props.onClickAlias}
+	                    knownMemIds={props.knownMemIds}
+	                  />
+	                </div>
+	              ) : null}
+	            </div>
+	            {rationale ? (
+	              <div className="mt-3 text-xs text-fg">
+	                <CitationMarkdown
                   text={rationale}
                   knownAliases={props.citationAliases}
                   onClickAlias={props.onClickAlias}
@@ -979,7 +1055,9 @@ function StructuredRecipes(props: {
       {notes ? (
         <div className="rounded-md border border-border bg-bg p-3 text-xs text-fg">
           <div className="mb-1 text-[11px] font-medium text-muted">overall_notes</div>
-          <div className="whitespace-pre-wrap">{notes}</div>
+          <div className="max-h-[420px] overflow-auto rounded-md border border-border bg-surface p-3">
+            <Markdown text={notes} />
+          </div>
         </div>
       ) : null}
     </div>

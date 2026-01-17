@@ -52,6 +52,37 @@ class ResolveModifierChecksResponse(BaseModel):
     items: list[ModifierCheckItem]
 
 
+@router.get("/runs/{run_id}/modifier_checks")
+def get_run_modifier_checks(run_id: str) -> ResolveModifierChecksResponse:
+    """Read cached modifier checks for a run (no recompute).
+
+    WebUI should prefer this endpoint to avoid triggering external PubChem requests on page load.
+    Use POST /modifier_checks to compute (best-effort) and cache the result.
+    """
+    store = SQLiteStore()
+    try:
+        if store.get_run(run_id=run_id) is None:
+            raise APIError(status_code=404, code="not_found", message="Run not found.")
+
+        cached = store.get_latest_event(run_id=run_id, event_type="modifier_checks")
+        if cached is None:
+            raise APIError(status_code=404, code="not_found", message="Modifier checks not found.")
+
+        try:
+            payload = json.loads(str(cached["payload_json"]))
+            items_any = payload.get("items") if isinstance(payload, dict) else None
+            items = items_any if isinstance(items_any, list) else []
+            return ResolveModifierChecksResponse(
+                run_id=run_id,
+                items=[ModifierCheckItem(**it) for it in items if isinstance(it, dict)],
+            )
+        except Exception as e:
+            # Cached payload is invalid; treat as missing so the caller can recompute via POST.
+            raise APIError(status_code=404, code="not_found", message="Modifier checks not found.") from e
+    finally:
+        store.close()
+
+
 @router.get("/runs")
 def list_runs(
     batch_id: str | None = Query(default=None),
@@ -201,14 +232,20 @@ def resolve_run_modifier_checks(run_id: str, body: ResolveModifierChecksRequest 
                 )
             )
 
-        store.append_event(
-            run_id,
-            "modifier_checks",
-            {
-                "ts": float(out_row["created_at"]) if out_row.get("created_at") is not None else None,
-                "items": [it.model_dump(mode="python") for it in resolved_items],
-            },
-        )
+        # Best-effort cache: never fail the endpoint due to trace write issues.
+        # (UI display must not be blocked by caching failures.)
+        try:
+            store.append_event(
+                run_id,
+                "modifier_checks",
+                {
+                    # sqlite3.Row behaves like a mapping but does not implement .get()
+                    "ts": float(out_row["created_at"]) if out_row["created_at"] is not None else None,
+                    "items": [it.model_dump(mode="python") for it in resolved_items],
+                },
+            )
+        except Exception:
+            pass
 
         return ResolveModifierChecksResponse(run_id=run_id, items=resolved_items)
     finally:

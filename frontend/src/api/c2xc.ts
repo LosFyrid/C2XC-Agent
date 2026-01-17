@@ -107,6 +107,11 @@ export function getRunOutput(runId: string): Promise<RunOutputResponse> {
   return apiFetch(`/runs/${runId}/output`)
 }
 
+// Read cached modifier checks only (no PubChem requests).
+export function getRunModifierChecks(runId: string): Promise<ModifierChecksResponse> {
+  return apiFetch(`/runs/${runId}/modifier_checks`)
+}
+
 export function resolveRunModifierChecks(runId: string, opts?: { force?: boolean }): Promise<ModifierChecksResponse> {
   return apiFetch(`/runs/${runId}/modifier_checks`, {
     method: 'POST',

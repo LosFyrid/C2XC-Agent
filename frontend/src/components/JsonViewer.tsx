@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { RichTextViewer } from './RichTextViewer'
 
 function safeStringify(value: unknown): string {
   try {
@@ -147,13 +148,27 @@ function TreeNode(props: {
 
   const isArray = Array.isArray(value)
   const isObj = isRecord(value)
-  const isExpandable = isArray || isObj
+  const isRichString =
+    typeof value === 'string' &&
+    (value.length > 120 ||
+      value.includes('\n') ||
+      value.includes('<sub') ||
+      value.includes('<sup') ||
+      value.includes('$\\') ||
+      value.includes('\\rightarrow') ||
+      value.includes('\\to'))
+  const isExpandable = isArray || isObj || isRichString
   const open = !!expanded[path]
 
   const label = useMemo(() => {
     if (isArray) return `${name}: Array(${value.length})`
     if (isObj) return `${name}: Object(${Object.keys(value).length})`
-    if (typeof value === 'string') return `${name}: "${value.length > 120 ? value.slice(0, 120) + '…' : value}"`
+    if (typeof value === 'string') {
+      const maxPreview = 120
+      const preview = value.length > maxPreview ? value.slice(0, maxPreview) + '…' : value
+      const meta = value.length > maxPreview ? ` (${value.length} chars)` : ''
+      return `${name}: "${preview}"${meta}`
+    }
     if (value === null) return `${name}: null`
     return `${name}: ${String(value)}`
   }, [isArray, isObj, name, value])
@@ -183,10 +198,21 @@ function TreeNode(props: {
       {isExpandable && open ? (
         isArray ? (
           <TreeArray value={value} path={path} depth={depth} expanded={expanded} toggle={toggle} search={search} />
-        ) : (
+        ) : isObj ? (
           <TreeObject value={value} path={path} depth={depth} expanded={expanded} toggle={toggle} search={search} />
+        ) : (
+          <TreeString value={String(value ?? '')} depth={depth} />
         )
       ) : null}
+    </div>
+  )
+}
+
+function TreeString(props: { value: string; depth: number }) {
+  const indent = { paddingLeft: `${(props.depth + 1) * 14}px` }
+  return (
+    <div className="mt-1" style={indent}>
+      <RichTextViewer text={props.value} maxHeightClass="max-h-[420px]" />
     </div>
   )
 }
@@ -199,8 +225,10 @@ function TreeObject(props: {
   toggle: (path: string) => void
   search: string
 }) {
+  const defaultLimit = 80
+  const [limit, setLimit] = useState(defaultLimit)
+
   const keys = Object.keys(props.value)
-  const limit = 80
   const shown = keys.slice(0, limit)
   const remaining = keys.length - shown.length
 
@@ -219,7 +247,25 @@ function TreeObject(props: {
         />
       ))}
       {remaining > 0 ? (
-        <div className="pl-6 text-muted">… {remaining} more keys hidden</div>
+        <div className="pl-6">
+          <div className="text-muted">… {remaining} more keys hidden</div>
+          <div className="mt-1 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setLimit((n) => Math.min(keys.length, n + defaultLimit))}
+              className="rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-fg hover:border-accent"
+            >
+              Show more
+            </button>
+            <button
+              type="button"
+              onClick={() => setLimit(keys.length)}
+              className="rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-fg hover:border-accent"
+            >
+              Show all
+            </button>
+          </div>
+        </div>
       ) : null}
     </div>
   )
@@ -233,7 +279,9 @@ function TreeArray(props: {
   toggle: (path: string) => void
   search: string
 }) {
-  const limit = 50
+  const defaultLimit = 50
+  const [limit, setLimit] = useState(defaultLimit)
+
   const shown = props.value.slice(0, limit)
   const remaining = props.value.length - shown.length
 
@@ -252,9 +300,26 @@ function TreeArray(props: {
         />
       ))}
       {remaining > 0 ? (
-        <div className="pl-6 text-muted">… {remaining} more items hidden</div>
+        <div className="pl-6">
+          <div className="text-muted">… {remaining} more items hidden</div>
+          <div className="mt-1 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setLimit((n) => Math.min(props.value.length, n + defaultLimit))}
+              className="rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-fg hover:border-accent"
+            >
+              Show more
+            </button>
+            <button
+              type="button"
+              onClick={() => setLimit(props.value.length)}
+              className="rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-fg hover:border-accent"
+            >
+              Show all
+            </button>
+          </div>
+        </div>
       ) : null}
     </div>
   )
 }
-
