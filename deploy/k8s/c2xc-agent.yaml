@@ -71,7 +71,7 @@ spec:
 
       containers:
         - name: backend
-          image: c2xc-agent-backend:v0.2
+          image: harbor.pic-aichem.online/sunyk/c2xc-agent-backend:v0.2
           imagePullPolicy: Always
           imagePullSecrets: 
             - name: harbor-auth
@@ -187,7 +187,7 @@ spec:
               drop: ["ALL"]
 
         - name: frontend
-          image: c2xc-agent-frontend:v0.2
+          image: harbor.pic-aichem.online/sunyk/c2xc-agent-frontend:v0.2
           imagePullPolicy: Always
           imagePullSecrets: 
             - name: harbor-auth
