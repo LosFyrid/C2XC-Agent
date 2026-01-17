@@ -73,6 +73,8 @@ spec:
         - name: backend
           image: c2xc-agent-backend:v0.2
           imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
           ports:
             - name: http
               containerPort: 8000
@@ -187,6 +189,8 @@ spec:
         - name: frontend
           image: c2xc-agent-frontend:v0.2
           imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
           ports:
             - name: http-web
               containerPort: 80
