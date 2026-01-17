@@ -2,13 +2,18 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: c2xc-agent-backend-data
+  namespace: custom-app
   labels:
     app: c2xc-agent
   annotations:
-    # 不因 Git 中移除/重命名而被 prune 删除
-    kustomize.toolkit.fluxcd.io/prune: disabled
-    # 仅在资源不存在时创建；后续不再尝试对 PVC 做 apply（避免不可变字段报错）
+    # Flux: 不因 Git 中移除/重命名而被 prune 删除
+    kustomize.toolkit.fluxcd.io/prune: Disabled
+    # Flux: 仅在资源不存在时创建；后续不再尝试对 PVC 做 apply（避免不可变字段报错）
     kustomize.toolkit.fluxcd.io/ssa: IfNotPresent
+    # Flux: 避免因上层 Kustomization 设置 force 而触发 PVC 的 delete/recreate
+    kustomize.toolkit.fluxcd.io/force: Disabled
+    # Helm(Flux helm-controller): 避免 upgrade/uninstall/rollback 过程中删除 PVC
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -38,7 +43,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: c2xc-agent
-  namespace: c2xc
+  namespace: custom-app
 spec:
   replicas: 1
   selector:
@@ -78,8 +83,6 @@ spec:
         - name: backend
           image: harbor.pic-aichem.online/sunyk/c2xc-agent-backend:v0.2
           imagePullPolicy: Always
-          imagePullSecrets: 
-            - name: harbor-auth
           ports:
             - name: http-api
               containerPort: 8000
@@ -196,8 +199,6 @@ spec:
         - name: frontend
           image: harbor.pic-aichem.online/sunyk/c2xc-agent-frontend:v0.2
           imagePullPolicy: Always
-          imagePullSecrets: 
-            - name: harbor-auth
           ports:
             - name: http-web
               containerPort: 8080
@@ -222,6 +223,9 @@ spec:
             capabilities:
               drop: ["ALL"]
 
+      imagePullSecrets:
+        - name: harbor-auth
+
       volumes:
         - name: c2xc-agent-backend-data
           persistentVolumeClaim:
@@ -232,4 +236,3 @@ spec:
           emptyDir: {}
         - name: tmp-data
           emptyDir: {}
-
