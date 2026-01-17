@@ -127,6 +127,10 @@ def list_memories(
             d = _item_to_dict(item)
             if distance is not None:
                 d["distance"] = float(distance)
+            matched = r.get("matched_claims")
+            if isinstance(matched, list) and matched:
+                # Optional: surface claim-level match hints for UI/debugging.
+                d["matched_claims"] = matched[:6]
             items.append(d)
 
         return {"items": items, "has_more": False, "next_cursor": None}

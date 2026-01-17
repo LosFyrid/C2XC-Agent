@@ -11,6 +11,7 @@ from src.api.errors import APIError
 from src.api.pagination import Cursor, CursorError, decode_cursor, encode_cursor
 from src.runtime.reasoningbank_jobs import enqueue_rb_learn_job
 from src.storage.sqlite_store import SQLiteStore
+from src.tools.pubchem import resolve_pubchem
 
 
 router = APIRouter()
@@ -29,6 +30,26 @@ class UpsertRunFeedbackRequest(BaseModel):
     products: list[FeedbackProductInput] = Field(default_factory=list)
     schema_version: int = Field(default=1)
     extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResolveModifierChecksRequest(BaseModel):
+    force: bool = Field(default=False, description="Force recompute even if cached in trace events.")
+
+
+class ModifierCheckItem(BaseModel):
+    query: str
+    normalized_query: str
+    status: str
+    cid: int | None = None
+    canonical_smiles: str | None = None
+    inchikey: str | None = None
+    has_cooh: bool | None = None
+    error: str | None = None
+
+
+class ResolveModifierChecksResponse(BaseModel):
+    run_id: str
+    items: list[ModifierCheckItem]
 
 
 @router.get("/runs")
@@ -114,6 +135,82 @@ def get_run_output(run_id: str) -> dict[str, Any]:
             "citations": payload.get("citations") or {},
             "memory_ids": payload.get("memory_ids") or [],
         }
+    finally:
+        store.close()
+
+
+@router.post("/runs/{run_id}/modifier_checks")
+def resolve_run_modifier_checks(run_id: str, body: ResolveModifierChecksRequest | None = None) -> ResolveModifierChecksResponse:
+    """Resolve small_molecule_modifier via PubChem and compute a best-effort COOH signal.
+
+    This is intended for WebUI display / manual review. It must NOT block the run itself.
+    Results are cached as a trace event (best-effort) to avoid repeated external requests.
+    """
+    store = SQLiteStore()
+    try:
+        if store.get_run(run_id=run_id) is None:
+            raise APIError(status_code=404, code="not_found", message="Run not found.")
+
+        force = bool(body.force) if body is not None else False
+        cached = store.get_latest_event(run_id=run_id, event_type="modifier_checks")
+        if cached is not None and not force:
+            try:
+                payload = json.loads(str(cached["payload_json"]))
+                items_any = payload.get("items") if isinstance(payload, dict) else None
+                items = items_any if isinstance(items_any, list) else []
+                return ResolveModifierChecksResponse(
+                    run_id=run_id,
+                    items=[ModifierCheckItem(**it) for it in items if isinstance(it, dict)],
+                )
+            except Exception:
+                # Fall through to recompute.
+                pass
+
+        out_row = store.get_latest_event(run_id=run_id, event_type="final_output")
+        if out_row is None:
+            raise APIError(status_code=404, code="not_found", message="Run output not found.")
+        payload = json.loads(str(out_row["payload_json"]))
+        recipes = (
+            ((payload.get("recipes_json") or {}) if isinstance(payload.get("recipes_json"), dict) else {}).get("recipes")
+        )
+        recipes_list = recipes if isinstance(recipes, list) else []
+        modifiers: list[str] = []
+        seen: set[str] = set()
+        for r in recipes_list:
+            if not isinstance(r, dict):
+                continue
+            mod = str(r.get("small_molecule_modifier") or "").strip()
+            if not mod or mod in seen:
+                continue
+            seen.add(mod)
+            modifiers.append(mod)
+
+        resolved_items: list[ModifierCheckItem] = []
+        for mod in modifiers:
+            res = resolve_pubchem(mod)
+            resolved_items.append(
+                ModifierCheckItem(
+                    query=res.query,
+                    normalized_query=res.normalized_query,
+                    status=res.status,
+                    cid=res.cid,
+                    canonical_smiles=res.canonical_smiles,
+                    inchikey=res.inchikey,
+                    has_cooh=res.has_cooh,
+                    error=res.error,
+                )
+            )
+
+        store.append_event(
+            run_id,
+            "modifier_checks",
+            {
+                "ts": float(out_row["created_at"]) if out_row.get("created_at") is not None else None,
+                "items": [it.model_dump(mode="python") for it in resolved_items],
+            },
+        )
+
+        return ResolveModifierChecksResponse(run_id=run_id, items=resolved_items)
     finally:
         store.close()
 

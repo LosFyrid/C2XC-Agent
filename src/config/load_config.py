@@ -117,6 +117,9 @@ class ReasoningBankConfig:
     learn_deref_full_chars: int
     learn_deref_list_events_default_limit: int
     learn_deref_list_events_max_limit: int
+    # RB learn: candidate memory selection for claim-level state updates.
+    learn_candidate_max_items: int
+    learn_candidate_semantic_top_k: int
 
 
 @dataclass(frozen=True)
@@ -325,6 +328,14 @@ def load_app_config(path: Path | None = None) -> AppConfig:
             learn_deref_list_events_max_limit=_as_int(
                 reasoningbank.get("learn_deref_list_events_max_limit"),
                 key="reasoningbank.learn_deref_list_events_max_limit",
+            ),
+            learn_candidate_max_items=_as_int(
+                reasoningbank.get("learn_candidate_max_items"),
+                key="reasoningbank.learn_candidate_max_items",
+            ),
+            learn_candidate_semantic_top_k=_as_int(
+                reasoningbank.get("learn_candidate_semantic_top_k"),
+                key="reasoningbank.learn_candidate_semantic_top_k",
             ),
         ),
         roles=RolesConfig(

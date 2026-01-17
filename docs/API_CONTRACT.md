@@ -219,6 +219,43 @@ Response：
 }
 ```
 
+### 2.6.1 解析 small_molecule_modifier（PubChem / COOH 审查）
+
+> 目的：为实验人员提供 **可复盘的结构证据**（CID/SMILES），并做 best-effort 的 COOH 结构信号提示。  
+> 注意：这是 **WebUI 展示/人工审查** 用，不应阻塞 run 本身。
+
+- `POST /runs/{run_id}/modifier_checks`
+
+Request：
+
+```json
+{ "force": false }
+```
+
+Response：
+
+```json
+{
+  "run_id": "run_xxx",
+  "items": [
+    {
+      "query": "benzoic acid (-COOH)",
+      "normalized_query": "benzoic acid",
+      "status": "resolved",
+      "cid": 243,
+      "canonical_smiles": "O=C(O)c1ccccc1",
+      "inchikey": "WPYMKLBDIGXBTP-UHFFFAOYSA-N",
+      "has_cooh": true,
+      "error": null
+    }
+  ]
+}
+```
+
+语义：
+- 服务端会将结果 best-effort 缓存为 trace event：`modifier_checks`（避免重复请求外部 PubChem）。
+- `has_cooh` 为启发式判定（无 RDKit 时的近似），用于提示；最终以人工核查为准。
+
 ### 2.7 读取 trace/events（UI 调试核心）
 
 - `GET /runs/{run_id}/events?limit=&cursor=&event_type=&since=&until=&include_payload=`

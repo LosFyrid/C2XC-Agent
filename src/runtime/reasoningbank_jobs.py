@@ -105,6 +105,7 @@ def _restore_snapshot(rb: ReasoningBankStore, snapshot: dict[str, Any], *, actor
         extra=dict(snapshot.get("extra") or {}),
         now_ts=float(snapshot.get("updated_at") or 0.0) or None,
         preserve_created_at=True,
+        validate=False,
     )
 
     store.append_mem_edit_log(
@@ -213,6 +214,7 @@ def rollback_rb_delta(
                         schema_version=before.schema_version,
                         extra=before.extra,
                         preserve_created_at=True,
+                        validate=False,
                     )
                     store.append_mem_edit_log(
                         mem_id=mem_id,

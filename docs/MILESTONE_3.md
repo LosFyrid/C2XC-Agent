@@ -18,6 +18,11 @@
 - 引用形态：
   - KB chunk：`[C1]`（alias）
   - RB memory：`mem:<uuid>`（例如 `mem:123e4567-e89b-12d3-a456-426614174000`）
+- RB 经验条目协议（Milestone 3.1 升级）：
+  - **memory 真值单位仍是 item**（UI 浏览/引用单位不变：`mem:<id>`）
+  - **检索单位下沉为 claim**：Chroma 同 collection 内区分 `doc_type=item|claim`，对 `doc_type=claim` 做 embedding 检索，再聚合返回 item
+  - `reasoningbank_item.content` 升级为严格结构化 `RBMEM_CLAIMS_V1`（可解析/可校验/可渲染）
+  - 详见：`docs/MILESTONE_3_RB_CLAIMS_V1_PLAN.md`
 - 严格回滚（硬语义）：
   - RB learn 每次必须记录 delta（add/update/archive 的 ops）
   - feedback 更新触发 RB learn 前：必须先回滚该 run 的已应用 delta，再按新 feedback 重学

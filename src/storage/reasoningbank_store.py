@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Protocol
 
 from src.config.load_config import AppConfig
+from src.reasoningbank.rbmem_claims_v1 import (
+    RBMemClaimsV1ValidationError,
+    claim_text_projection,
+    contains_kb_alias,
+    is_rbmem_claims_v1,
+    parse_rbmem_claims_v1,
+    validate_rbmem_claims_v1,
+)
 
 
 class ReasoningBankError(RuntimeError):
@@ -162,6 +170,9 @@ def _resolve_embedding_send_dimensions(default: bool) -> bool:
 
 
 _CHROMA_OP_LOCK = threading.RLock()
+
+_DOC_TYPE_ITEM = "item"
+_DOC_TYPE_CLAIM = "claim"
 
 
 def default_chroma_dir() -> Path:
@@ -408,6 +419,7 @@ def _metadata_to_item(*, mem_id: str, doc: str, meta: dict[str, Any] | None) -> 
 
 def _item_to_metadata(item: MemoryItem) -> dict[str, Any]:
     return {
+        "doc_type": _DOC_TYPE_ITEM,
         "status": item.status,
         "role": item.role,
         "type": item.type,
@@ -417,6 +429,30 @@ def _item_to_metadata(item: MemoryItem) -> dict[str, Any]:
         "schema_version": int(item.schema_version),
         "extra_json": json.dumps(item.extra or {}, ensure_ascii=False, separators=(",", ":")),
     }
+
+
+def _claim_doc_id(*, parent_mem_id: str, claim_id: str) -> str:
+    return f"{parent_mem_id}::claim::{claim_id}"
+
+
+def _claim_to_metadata(*, parent: MemoryItem, claim_id: str, claim_status: str | None) -> dict[str, Any]:
+    # Mirror item filters onto claim docs so query(where=...) keeps working.
+    meta: dict[str, Any] = {
+        "doc_type": _DOC_TYPE_CLAIM,
+        "parent_mem_id": str(parent.mem_id),
+        "claim_id": str(claim_id),
+        "status": str(parent.status),
+        "role": str(parent.role),
+        "type": str(parent.type),
+        "source_run_id": str(parent.source_run_id or ""),
+        # Keep these aligned with the parent item to make maintenance/debugging easier.
+        "created_at": float(parent.created_at),
+        "updated_at": float(parent.updated_at),
+        "schema_version": int(parent.schema_version),
+    }
+    if claim_status:
+        meta["claim_status"] = str(claim_status)
+    return meta
 
 
 def _build_where(
@@ -533,6 +569,9 @@ class ReasoningBankStore:
         mid = (mem_id or "").strip()
         if not mid:
             return None
+        if "::claim::" in mid:
+            # Claim docs are internal index artifacts; only item ids are valid for external reads.
+            return None
         with _CHROMA_OP_LOCK:
             res = self._collection.get(ids=[mid], include=["metadatas", "documents"])
         ids = res.get("ids") or []
@@ -598,6 +637,11 @@ class ReasoningBankStore:
             for i, mem_id in enumerate(ids):
                 doc = str(docs[i] or "") if include_documents and i < len(docs) else ""
                 meta = metas[i] if i < len(metas) else None
+                # Claim docs are internal index artifacts; keep list_all() item-only.
+                if str(mem_id).find("::claim::") != -1:
+                    continue
+                if isinstance(meta, dict) and str(meta.get("doc_type") or "") == _DOC_TYPE_CLAIM:
+                    continue
                 yield _metadata_to_item(mem_id=str(mem_id), doc=doc, meta=meta)
 
             offset += len(ids)
@@ -631,28 +675,160 @@ class ReasoningBankStore:
         q = (query or "").strip()
         if not q:
             return []
-        where_or_none = _build_where(role=role, status=status, type=type)
+
+        # Claim-level retrieval: query claim docs and aggregate to item docs.
+        where_clauses: list[dict[str, Any]] = []
+        base = _build_where(role=role, status=status, type=type)
+        if base is not None:
+            if "$and" in base and isinstance(base.get("$and"), list):
+                where_clauses.extend(list(base["$and"]))
+            else:
+                where_clauses.append(base)
+        where_clauses.append({"doc_type": _DOC_TYPE_CLAIM})
+        where_or_none: dict[str, Any] | None
+        if not where_clauses:
+            where_or_none = None
+        elif len(where_clauses) == 1:
+            where_or_none = where_clauses[0]
+        else:
+            where_or_none = {"$and": where_clauses}
+
+        # We need enough claim hits to produce n_results distinct items.
+        # Use a small multiplier to reduce the risk of multiple claims from the same parent dominating.
+        claim_k = max(int(n_results) * 4, int(n_results))
 
         with _CHROMA_OP_LOCK:
             res = self._collection.query(
                 query_texts=[q],
-                n_results=int(n_results),
+                n_results=int(claim_k),
                 where=where_or_none,
                 include=["metadatas", "documents", "distances"],
             )
+
         ids = (res.get("ids") or [[]])[0] or []
         metas = (res.get("metadatas") or [[]])[0] or []
         docs = (res.get("documents") or [[]])[0] or []
         distances = (res.get("distances") or [[]])[0] or []
 
-        out: list[dict[str, Any]] = []
-        for i, mem_id in enumerate(ids):
-            doc = str(docs[i] or "") if i < len(docs) else ""
+        by_parent: dict[str, dict[str, Any]] = {}
+        for i, doc_id in enumerate(ids):
             meta = metas[i] if i < len(metas) else None
-            distance = float(distances[i]) if i < len(distances) and distances[i] is not None else None
-            item = _metadata_to_item(mem_id=str(mem_id), doc=doc, meta=meta)
-            out.append({"item": item, "distance": distance})
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("doc_type") or "") != _DOC_TYPE_CLAIM:
+                continue
+            parent_id = str(meta.get("parent_mem_id") or "").strip()
+            if not parent_id:
+                continue
+            dist = float(distances[i]) if i < len(distances) and distances[i] is not None else None
+            hit = {
+                "claim_id": str(meta.get("claim_id") or "").strip() or None,
+                "claim_status": str(meta.get("claim_status") or "").strip() or None,
+                "distance": dist,
+                "text": str(docs[i] or "") if i < len(docs) else "",
+            }
+            cur = by_parent.get(parent_id)
+            if cur is None:
+                by_parent[parent_id] = {
+                    "distance": dist,
+                    "matched_claims": [hit],
+                }
+                continue
+            # Keep best distance for ranking.
+            best = cur.get("distance")
+            if best is None or (dist is not None and dist < float(best)):
+                cur["distance"] = dist
+            cur["matched_claims"].append(hit)
+
+        # Sort parents by best (min) distance.
+        ranked = sorted(
+            by_parent.items(),
+            key=lambda kv: float(kv[1]["distance"]) if kv[1].get("distance") is not None else 1e9,
+        )
+        top_parent_ids = [pid for pid, _ in ranked[: int(n_results)]]
+        if not top_parent_ids:
+            return []
+
+        items = self.get_many(mem_ids=top_parent_ids, include_content=True)
+        by_id = {it.mem_id: it for it in items}
+
+        out: list[dict[str, Any]] = []
+        for parent_id, meta in ranked[: int(n_results)]:
+            item = by_id.get(parent_id)
+            if item is None:
+                continue
+            out.append(
+                {
+                    "item": item,
+                    "distance": meta.get("distance"),
+                    "matched_claims": meta.get("matched_claims") or [],
+                }
+            )
         return out
+
+    def _delete_claim_docs(self, *, parent_mem_id: str) -> None:
+        parent = (parent_mem_id or "").strip()
+        if not parent:
+            return
+        try:
+            self._collection.delete(where={"$and": [{"doc_type": _DOC_TYPE_CLAIM}, {"parent_mem_id": parent}]})
+            return
+        except Exception:
+            # Fallback: list ids then delete explicitly.
+            try:
+                res = self._collection.get(
+                    where={"$and": [{"doc_type": _DOC_TYPE_CLAIM}, {"parent_mem_id": parent}]},
+                    include=[],
+                    limit=5000,
+                )
+                ids = [str(x) for x in (res.get("ids") or []) if str(x).strip()]
+                if ids:
+                    self._collection.delete(ids=ids)
+            except Exception:
+                return
+
+    def _build_claim_docs_for_item(self, item: MemoryItem) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+        """Build derived claim docs for a given item (best-effort)."""
+        ids: list[str] = []
+        docs: list[str] = []
+        metas: list[dict[str, Any]] = []
+
+        if item.type == "reasoningbank_item" and is_rbmem_claims_v1(item.content):
+            try:
+                parsed = parse_rbmem_claims_v1(item.content)
+                for claim in parsed.claims:
+                    cid = _claim_doc_id(parent_mem_id=item.mem_id, claim_id=claim.claim_id)
+                    ids.append(cid)
+                    docs.append(claim_text_projection(claim))
+                    metas.append(_claim_to_metadata(parent=item, claim_id=claim.claim_id, claim_status=claim.status))
+                return ids, docs, metas
+            except Exception:
+                # Fall through to legacy projection.
+                pass
+
+        # Legacy/manual note: index the full content as a single claim doc for retrieval.
+        cid = _claim_doc_id(parent_mem_id=item.mem_id, claim_id="legacy")
+        ids.append(cid)
+        docs.append(str(item.content or "")[:1000])
+        metas.append(_claim_to_metadata(parent=item, claim_id="legacy", claim_status=None))
+        return ids, docs, metas
+
+    def rebuild_claim_index(self, *, include_archived: bool = True) -> int:
+        """Rebuild derived claim docs for all items in the collection.
+
+        Returns the number of items processed.
+        """
+        processed = 0
+        status = None if include_archived else ["active"]
+        items = self.list_all(status=status, include_content=True)
+        with _CHROMA_OP_LOCK:
+            for it in items:
+                self._delete_claim_docs(parent_mem_id=it.mem_id)
+                ids, docs, metas = self._build_claim_docs_for_item(it)
+                if ids:
+                    self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
+                processed += 1
+        return processed
 
     def upsert(
         self,
@@ -667,6 +843,7 @@ class ReasoningBankStore:
         extra: dict[str, Any] | None = None,
         now_ts: float | None = None,
         preserve_created_at: bool = True,
+        validate: bool = True,
     ) -> MemoryItem:
         now = float(now_ts) if now_ts is not None else _utc_ts()
         mid = (mem_id or "").strip() or _new_uuid()
@@ -692,8 +869,31 @@ class ReasoningBankStore:
         if not item.content:
             raise ReasoningBankError("content cannot be empty.")
 
+        # Hard gate: RB items must be structured; manual notes are free-text.
+        #
+        # NOTE: For strict rollback / migrations we may need to restore legacy snapshots that
+        # were created before RBMEM_CLAIMS_V1 existed. Callers can set validate=False for that
+        # very specific purpose (never for normal writes).
+        if validate and item.type == "reasoningbank_item":
+            try:
+                validate_rbmem_claims_v1(item.content, max_claims=10, forbid_kb_alias=True)
+            except RBMemClaimsV1ValidationError as e:
+                # Provide a concise error with actionable details (issues list).
+                details = "; ".join(e.issues[:6])
+                raise ReasoningBankError(f"Invalid RBMEM_CLAIMS_V1 content. {details}".strip()) from e
+
         with _CHROMA_OP_LOCK:
-            self._collection.upsert(ids=[item.mem_id], documents=[item.content], metadatas=[_item_to_metadata(item)])
+            # 1) Upsert item doc (truth).
+            self._collection.upsert(
+                ids=[item.mem_id],
+                documents=[item.content],
+                metadatas=[_item_to_metadata(item)],
+            )
+            # 2) Rebuild derived claim docs (index).
+            self._delete_claim_docs(parent_mem_id=item.mem_id)
+            ids, docs, metas = self._build_claim_docs_for_item(item)
+            if ids:
+                self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
         return item
 
     def archive(self, *, mem_id: str, now_ts: float | None = None) -> MemoryItem:
@@ -713,4 +913,5 @@ class ReasoningBankStore:
             extra=existing.extra,
             now_ts=now_ts,
             preserve_created_at=True,
+            validate=False,
         )

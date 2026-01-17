@@ -1252,8 +1252,24 @@ class RecapEngine:
 
                                     seen: set[str] = set()
                                     mem_ids: list[str] = []
+                                    matched_by_id: dict[str, list[dict[str, Any]]] = {}
+                                    distance_by_id: dict[str, float | None] = {}
                                     for r in results:
                                         it: MemoryItem = r["item"]
+                                        matched = r.get("matched_claims") or []
+                                        if isinstance(matched, list) and matched:
+                                            matched_by_id.setdefault(it.mem_id, []).extend(
+                                                [m for m in matched if isinstance(m, dict)]
+                                            )
+                                        distance = r.get("distance")
+                                        if distance is not None:
+                                            try:
+                                                d = float(distance)
+                                            except Exception:
+                                                d = None
+                                            prev = distance_by_id.get(it.mem_id)
+                                            if prev is None or (d is not None and d < prev):
+                                                distance_by_id[it.mem_id] = d
                                         if it.mem_id in seen:
                                             continue
                                         seen.add(it.mem_id)
@@ -1269,9 +1285,26 @@ class RecapEngine:
                                         it = rt.mem_id_to_item.get(mid)
                                         if it is None:
                                             continue
-                                        snippet = it.content.replace("\n", " ").strip()
-                                        if len(snippet) > 200:
-                                            snippet = snippet[:200] + "…"
+                                        snippet = ""
+                                        matched = matched_by_id.get(mid) or []
+                                        if matched:
+                                            # Show the best-matching claim snippet when available.
+                                            best = sorted(
+                                                matched,
+                                                key=lambda m: float(m.get("distance")) if m.get("distance") is not None else 1e9,
+                                            )[0]
+                                            claim_id = str(best.get("claim_id") or "").strip()
+                                            claim_text = str(best.get("text") or "").replace("\n", " ").strip()
+                                            if len(claim_text) > 180:
+                                                claim_text = claim_text[:180] + "…"
+                                            if claim_id:
+                                                snippet = f"match={claim_id} :: {claim_text}"
+                                            else:
+                                                snippet = f"match :: {claim_text}"
+                                        if not snippet:
+                                            snippet = it.content.replace("\n", " ").strip()
+                                            if len(snippet) > 200:
+                                                snippet = snippet[:200] + "…"
                                         lines.append(f"mem:{it.mem_id} role={it.role} type={it.type} :: {snippet}")
                                     if len(mem_ids) > 8:
                                         lines.append("Use mem_list to view more, mem_get to open full content by mem_id.")
@@ -1292,6 +1325,8 @@ class RecapEngine:
                                                     "type": rt.mem_id_to_item[m].type,
                                                     "status": rt.mem_id_to_item[m].status,
                                                     "source_run_id": rt.mem_id_to_item[m].source_run_id,
+                                                    "distance": distance_by_id.get(m),
+                                                    "matched_claims": matched_by_id.get(m, [])[:6],
                                                 }
                                                 for m in mem_ids
                                                 if m in rt.mem_id_to_item
@@ -1729,8 +1764,22 @@ class RecapEngine:
 
                 seen: set[str] = set()
                 mem_ids: list[str] = []
+                matched_by_id: dict[str, list[dict[str, Any]]] = {}
+                distance_by_id: dict[str, float | None] = {}
                 for r in results:
                     it: MemoryItem = r["item"]
+                    matched = r.get("matched_claims") or []
+                    if isinstance(matched, list) and matched:
+                        matched_by_id.setdefault(it.mem_id, []).extend([m for m in matched if isinstance(m, dict)])
+                    distance = r.get("distance")
+                    if distance is not None:
+                        try:
+                            d = float(distance)
+                        except Exception:
+                            d = None
+                        prev = distance_by_id.get(it.mem_id)
+                        if prev is None or (d is not None and d < prev):
+                            distance_by_id[it.mem_id] = d
                     if it.mem_id in seen:
                         continue
                     seen.add(it.mem_id)
@@ -1747,9 +1796,25 @@ class RecapEngine:
                     it = rt.mem_id_to_item.get(mid)
                     if it is None:
                         continue
-                    snippet = it.content.replace("\n", " ").strip()
-                    if len(snippet) > 220:
-                        snippet = snippet[:220] + "…"
+                    snippet = ""
+                    matched = matched_by_id.get(mid) or []
+                    if matched:
+                        best = sorted(
+                            matched,
+                            key=lambda m: float(m.get("distance")) if m.get("distance") is not None else 1e9,
+                        )[0]
+                        claim_id = str(best.get("claim_id") or "").strip()
+                        claim_text = str(best.get("text") or "").replace("\n", " ").strip()
+                        if len(claim_text) > 200:
+                            claim_text = claim_text[:200] + "…"
+                        if claim_id:
+                            snippet = f"match={claim_id} :: {claim_text}"
+                        else:
+                            snippet = f"match :: {claim_text}"
+                    if not snippet:
+                        snippet = it.content.replace("\n", " ").strip()
+                        if len(snippet) > 220:
+                            snippet = snippet[:220] + "…"
                     lines.append(
                         f"mem:{it.mem_id} role={it.role} type={it.type} status={it.status} source_run_id={it.source_run_id or ''}\n"
                         f"{snippet}"
@@ -1775,6 +1840,8 @@ class RecapEngine:
                                 "type": rt.mem_id_to_item[m].type,
                                 "status": rt.mem_id_to_item[m].status,
                                 "source_run_id": rt.mem_id_to_item[m].source_run_id,
+                                "distance": distance_by_id.get(m),
+                                "matched_claims": matched_by_id.get(m, [])[:6],
                             }
                             for m in mem_ids
                             if m in rt.mem_id_to_item

@@ -74,12 +74,40 @@ class _FakeRBLearnLLM:
                 return ChatCompletionResult(content="", raw={}, tool_calls=tool_calls)
 
             # After one tool round, output a minimal valid extractor result.
+            rb_content = "\n".join(
+                [
+                    "RBMEM_CLAIMS_V1",
+                    "TOPIC=test memory (deref tools policy)",
+                    "SCOPE=global",
+                    "CLAIMS_JSON="
+                    + json.dumps(
+                        [
+                            {
+                                "claim_id": "c1",
+                                "status": "fact",
+                                "facts": {"source_run_ids": [self._run_id]},
+                                "inference": {
+                                    "summary": "dereference tools should respect facts-only + snapshot cutoff."
+                                },
+                                "constraint": {"avoid": [], "allow_positive": False},
+                                "conditions": [],
+                                "limitations": [],
+                                "support": {"count": 0, "run_ids": []},
+                                "contra": {"count": 0, "run_ids": []},
+                            }
+                        ],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "",
+                ]
+            )
             out = {
                 "items": [
                     {
                         "role": "global",
                         "type": "reasoningbank_item",
-                        "content": "test memory: dereference tools should respect facts-only + snapshot cutoff.",
+                        "content": rb_content,
                         "extra": {"test": True},
                     }
                 ]
@@ -166,4 +194,3 @@ def test_rb_learn_deref_blocks_llm_logs_and_snapshot_out_of_bounds(monkeypatch: 
             assert "snapshot_out_of_bounds" in codes
         finally:
             store.close()
-

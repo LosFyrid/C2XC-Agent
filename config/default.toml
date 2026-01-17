@@ -95,8 +95,11 @@ Run trace digest (JSON; tool usage + resolved citations/memories; no raw LLM pro
 Experiment feedback (JSON; includes products[] with value and fraction):
 {{feedback_json}}
 
-Relevant existing memories (for de-duplication; cite as mem:<id> when referencing):
-{{existing_memories_context}}
+FACTS digest (JSON; system-provided ground truth for this run; do NOT invent facts beyond this):
+{{facts_digest_json}}
+
+Candidate existing memories (for: (a) de-duplication, (b) claim verdict updates; cite as mem:<id>):
+{{candidate_memories_context}}
 
 Dereference policy (facts-only; within snapshot):
 - You MAY call tools to open original texts when needed:
@@ -115,6 +118,19 @@ Task:
    - grounded in the feedback signal (success/failure patterns).
 3) Do NOT invent literature citations. These are experience memories.
 4) Prefer 1–5 high-signal items over many low-value items.
+5) Strict output requirements for any reasoningbank_item:
+   - memory.content MUST be RBMEM_CLAIMS_V1 (key=value block) with CLAIMS_JSON array.
+   - Max 10 claims per item.
+   - claim.status must be one of: fact|hypothesis|conclusion
+   - Do NOT include run-local KB aliases like [C12] or [C5, C16] anywhere in RB memory content.
+   - Do NOT include next-step experimental instructions in constraint.
+   - Constraints default to negative constraints (avoid). Positive constraints (must/prefer) are allowed ONLY as explicit exceptions
+     with allow_positive=true and exception_reason.
+   - You may omit claim.facts (it will be injected by the system); do NOT fabricate facts.
+
+6) Additionally, update claim verdicts for candidate memories:
+   - For each candidate memory claim you can judge, output a verdict: support|contradict|irrelevant.
+   - Use only mem_id + claim_id from the candidate memories. Do not guess unknown ids.
 
 Return a single JSON object:
 {
@@ -122,13 +138,16 @@ Return a single JSON object:
     {
       "role": "global|orchestrator|mof_expert|tio2_expert",
       "type": "reasoningbank_item",
-      "content": "string",
+      "content": "RBMEM_CLAIMS_V1 block (string)",
       "extra": {
         "confidence": 0.0,
         "tags": ["string"],
         "notes": "string"
       }
     }
+  ],
+  "verdicts": [
+    { "mem_id": "uuid", "claim_id": "c1", "verdict": "support|contradict|irrelevant", "notes": "string" }
   ]
 }
 """
@@ -146,6 +165,9 @@ New proposed memory (JSON):
 Task:
 - Produce ONE canonical memory item content that preserves the useful parts of both without redundancy.
 - Keep it concise, actionable, and consistent with the fixed system constraints.
+- Output content MUST remain a valid RBMEM_CLAIMS_V1 block (strictly parseable).
+- Ensure the merged item has <= 10 claims (dedupe similar claims if needed).
+- Do NOT include run-local KB aliases like [C12] anywhere in the merged content.
 - If they are NOT near-duplicates, return content that keeps them separate by stating "NOT_DUPLICATE" as content.
 
 Return a single JSON object:
@@ -154,6 +176,10 @@ Return a single JSON object:
   "extra": { "merge_notes": "string", "source_run_ids": ["run_xxx"] }
 }
 """
+
+# RB learn candidate selection defaults (used for claim-level state updates).
+learn_candidate_max_items = 30
+learn_candidate_semantic_top_k = 25
 
 [priors]
 # Domain priors are always injected into the system prompt (not retrieved via RAG).

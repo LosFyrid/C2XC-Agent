@@ -8,6 +8,7 @@ import type {
   RunDetailResponse,
   RunListItem,
   RunOutputResponse,
+  ModifierChecksResponse,
   EvidenceItem,
   EventListItem,
   Product,
@@ -104,6 +105,13 @@ export function cancelBatch(
 
 export function getRunOutput(runId: string): Promise<RunOutputResponse> {
   return apiFetch(`/runs/${runId}/output`)
+}
+
+export function resolveRunModifierChecks(runId: string, opts?: { force?: boolean }): Promise<ModifierChecksResponse> {
+  return apiFetch(`/runs/${runId}/modifier_checks`, {
+    method: 'POST',
+    body: JSON.stringify({ force: Boolean(opts?.force) }),
+  })
 }
 
 export function listRunEvidence(params: {

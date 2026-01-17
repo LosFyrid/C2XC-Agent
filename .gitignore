@@ -31,5 +31,6 @@ dist/
 venv/
 
 AGENT.md
+CHANGELOG.md
 
 *.pdf

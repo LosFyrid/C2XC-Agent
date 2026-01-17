@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import traceback
 from dataclasses import dataclass
@@ -9,6 +10,14 @@ from typing import Any, cast
 
 from src.config.load_config import AppConfig
 from src.llm.openai_compat import OpenAICompatibleChatClient
+from src.reasoningbank.rbmem_claims_v1 import (
+    RBMEM_CLAIMS_V1_HEADER,
+    RBMemClaimsV1ParseError,
+    RBMemClaimsV1ValidationError,
+    is_rbmem_claims_v1,
+    parse_rbmem_claims_v1,
+    validate_rbmem_claims_v1,
+)
 from src.runtime.reasoningbank_jobs import rollback_rb_delta
 from src.storage.reasoningbank_store import MemoryItem, ReasoningBankError, ReasoningBankStore
 from src.storage.sqlite_store import SQLiteStore
@@ -66,6 +75,195 @@ _FORBIDDEN_TRACE_EVENT_TYPES = {
     "rb_llm_request",
     "rb_llm_response",
 }
+
+_KB_ALIAS_RE = re.compile(r"\[C\d+(?:\s*,\s*C\d+)*\]")
+
+
+def _strip_kb_aliases(text: str) -> str:
+    """Remove run-local KB aliases like [C12] from strings before persisting to RB."""
+    return _KB_ALIAS_RE.sub("", text or "").strip()
+
+
+def _strip_kb_aliases_any(value: Any) -> Any:
+    if isinstance(value, str):
+        return _strip_kb_aliases(value)
+    if isinstance(value, list):
+        return [_strip_kb_aliases_any(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_kb_aliases_any(v) for k, v in value.items()}
+    return value
+
+
+def _build_facts_digest(*, run_id: str, run_output_json: dict[str, Any], feedback_payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a system-provided FACTS digest for RB learn.
+
+    Hard rule: do not persist KB alias tokens like [C12] into RB memories.
+    """
+    rid = (run_id or "").strip()
+    recipes_any = (run_output_json.get("recipes_json") or {}).get("recipes") if isinstance(run_output_json.get("recipes_json"), dict) else None
+    recipes = recipes_any if isinstance(recipes_any, list) else []
+    recipe_facts: list[dict[str, Any]] = []
+    for r in recipes[:5]:
+        if not isinstance(r, dict):
+            continue
+        recipe_facts.append(
+            {
+                "M1": str(r.get("M1") or "").strip(),
+                "M2": str(r.get("M2") or "").strip(),
+                "atomic_ratio": str(r.get("atomic_ratio") or "").strip(),
+                "small_molecule_modifier": str(r.get("small_molecule_modifier") or "").strip(),
+            }
+        )
+
+    fb = feedback_payload.get("feedback") if isinstance(feedback_payload, dict) else None
+    fb_obj = fb if isinstance(fb, dict) else {}
+    products_any = fb_obj.get("products")
+    products = products_any if isinstance(products_any, list) else []
+
+    products_clean: list[dict[str, Any]] = []
+    total_value = 0.0
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        try:
+            v = float(p.get("value") or 0.0)
+        except Exception:
+            v = 0.0
+        try:
+            frac = float(p.get("fraction") or 0.0)
+        except Exception:
+            frac = 0.0
+        total_value += max(0.0, v)
+        products_clean.append(
+            {
+                "product_name": str(p.get("product_name") or ""),
+                "value": v,
+                "fraction": frac,
+            }
+        )
+
+    # Rank by fraction (selectivity signal) but keep value too (activity proxy).
+    products_top = sorted(products_clean, key=lambda x: float(x.get("fraction") or 0.0), reverse=True)[:8]
+
+    out: dict[str, Any] = {
+        "run_id": rid,
+        "recipes": recipe_facts,
+        "feedback": {
+            "score": fb_obj.get("score"),
+            "pros": str(fb_obj.get("pros") or ""),
+            "cons": str(fb_obj.get("cons") or ""),
+            "other": str(fb_obj.get("other") or ""),
+            "products_top": products_top,
+            "activity_total_value": float(total_value),
+        },
+    }
+    return cast(dict[str, Any], _strip_kb_aliases_any(out))
+
+
+def _build_candidate_query_seed(*, facts_digest: dict[str, Any]) -> str:
+    """Build a compact semantic query seed for retrieving related RB memories."""
+    parts: list[str] = []
+    run_id = str(facts_digest.get("run_id") or "").strip()
+    if run_id:
+        parts.append(f"run_id={run_id}")
+
+    recipes = facts_digest.get("recipes")
+    if isinstance(recipes, list):
+        for r in recipes[:3]:
+            if not isinstance(r, dict):
+                continue
+            s = " ".join(
+                [
+                    str(r.get("M1") or "").strip(),
+                    str(r.get("M2") or "").strip(),
+                    str(r.get("atomic_ratio") or "").strip(),
+                    str(r.get("small_molecule_modifier") or "").strip(),
+                ]
+            ).strip()
+            if s:
+                parts.append(s)
+
+    fb = facts_digest.get("feedback")
+    if isinstance(fb, dict):
+        products = fb.get("products_top")
+        if isinstance(products, list):
+            names = [str(p.get("product_name") or "").strip() for p in products if isinstance(p, dict)]
+            names = [n for n in names if n]
+            if names:
+                parts.append("products_top=" + ",".join(names[:6]))
+        pros = str(fb.get("pros") or "").strip()
+        cons = str(fb.get("cons") or "").strip()
+        other = str(fb.get("other") or "").strip()
+        text = " ".join([pros, cons, other]).strip()
+        if text:
+            # Keep it short; this is just for semantic retrieval.
+            if len(text) > 600:
+                text = text[:600] + "…"
+            parts.append(text)
+
+    return "\n".join([p for p in parts if p]).strip()
+
+
+def _collect_candidate_mem_ids(
+    *,
+    cfg: AppConfig,
+    rb: ReasoningBankStore,
+    run_output_json: dict[str, Any],
+    trace_digest: dict[str, Any],
+    facts_digest: dict[str, Any],
+) -> list[str]:
+    """Select a bounded candidate set of existing memories to update via claim verdicts."""
+    used: list[str] = []
+    seen: set[str] = set()
+
+    # 1) Strong signal: mem_ids explicitly referenced by final output.
+    mids_any = run_output_json.get("memory_ids")
+    if isinstance(mids_any, list):
+        for mid in mids_any:
+            s = str(mid or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            used.append(s)
+
+    # 2) Strong signal: mem_search results in trace digest (what the model actually looked at).
+    latest_mem_search = trace_digest.get("latest_mem_search")
+    if isinstance(latest_mem_search, dict):
+        results_any = latest_mem_search.get("results")
+        if isinstance(results_any, list):
+            for r in results_any:
+                if not isinstance(r, dict):
+                    continue
+                mid = str(r.get("mem_id") or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                used.append(mid)
+
+    # 3) Recall: semantic claim-search on run facts digest.
+    seed = _build_candidate_query_seed(facts_digest=facts_digest)
+    sem_k = int(cfg.reasoningbank.learn_candidate_semantic_top_k)
+    sem_results = rb.query(
+        query=seed,
+        n_results=max(sem_k, 1),
+        status=["active"],
+        type=["reasoningbank_item"],
+    )
+    sem_ranked: list[str] = []
+    for r in sem_results:
+        it: MemoryItem = r["item"]
+        if it.mem_id in seen:
+            continue
+        seen.add(it.mem_id)
+        sem_ranked.append(it.mem_id)
+
+    cap = int(cfg.reasoningbank.learn_candidate_max_items)
+    out = used[:]
+    for mid in sem_ranked:
+        if len(out) >= cap:
+            break
+        out.append(mid)
+    return out
 
 
 def _normalize_alias(value: str) -> str:
@@ -1027,7 +1225,21 @@ def _extractor_response_format() -> dict[str, Any]:
                             },
                             "required": ["role", "type", "content"],
                         },
-                    }
+                    },
+                    "verdicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "mem_id": {"type": "string", "minLength": 1},
+                                "claim_id": {"type": "string", "minLength": 1},
+                                "verdict": {"type": "string", "enum": ["support", "contradict", "irrelevant"]},
+                                "notes": {"type": "string"},
+                            },
+                            "required": ["mem_id", "claim_id", "verdict"],
+                        },
+                    },
                 },
                 "required": ["items"],
             },
@@ -1060,6 +1272,16 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _ensure_list_str(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for v in value:
+        if isinstance(v, str) and v.strip():
+            out.append(v.strip())
+    return out
+
+
 def _best_effort_similarity(distance: float | None) -> float | None:
     """Convert Chroma distance into a similarity-like score.
 
@@ -1072,6 +1294,137 @@ def _best_effort_similarity(distance: float | None) -> float | None:
         return 1.0 - float(distance)
     except Exception:
         return None
+
+
+def _render_rbmem_claims_v1(*, topic: str | None, scope: str | None, claims: list[dict[str, Any]]) -> str:
+    lines: list[str] = [RBMEM_CLAIMS_V1_HEADER]
+    if topic:
+        lines.append(f"TOPIC={topic}")
+    if scope:
+        lines.append(f"SCOPE={scope}")
+    lines.append("CLAIMS_JSON=" + json.dumps(claims, ensure_ascii=False, separators=(",", ":")))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _inject_facts_into_rbmem_claims_v1(
+    *,
+    content: str,
+    facts_digest: dict[str, Any],
+    run_id: str,
+) -> str:
+    """Inject/override claim.facts for all claims with system facts."""
+    doc = parse_rbmem_claims_v1(content)
+    claim_dicts: list[dict[str, Any]] = []
+    for c in doc.claims:
+        d = dict(c.__dict__)
+        # Always override facts with system digest + stable identifiers.
+        d["facts"] = {
+            **(facts_digest or {}),
+            "source_run_ids": [run_id],
+        }
+        # Normalize expected structures with defaults (avoid over-constraint, but keep stable keys).
+        if not isinstance(d.get("inference"), dict):
+            inf = str(d.get("inference") or "").strip()
+            d["inference"] = {"summary": inf} if inf else {"summary": ""}
+        if not isinstance(d.get("constraint"), dict):
+            d["constraint"] = {"avoid": [], "allow_positive": False}
+        if "allow_positive" not in d["constraint"]:
+            d["constraint"]["allow_positive"] = False
+        if "avoid" not in d["constraint"]:
+            d["constraint"]["avoid"] = []
+        d["conditions"] = _ensure_list_str(d.get("conditions"))
+        d["limitations"] = _ensure_list_str(d.get("limitations"))
+        d["support"] = _ensure_dict(d.get("support"))
+        d["contra"] = _ensure_dict(d.get("contra"))
+        d["support"]["run_ids"] = _ensure_list_str(d["support"].get("run_ids"))
+        d["support"]["count"] = int(d["support"].get("count") or len(d["support"]["run_ids"]) or 0)
+        d["contra"]["run_ids"] = _ensure_list_str(d["contra"].get("run_ids"))
+        d["contra"]["count"] = int(d["contra"].get("count") or len(d["contra"]["run_ids"]) or 0)
+        claim_dicts.append(d)
+
+    out = _render_rbmem_claims_v1(topic=doc.topic, scope=doc.scope, claims=claim_dicts)
+    # Re-validate after injection (hard constraints, esp. KB alias).
+    validate_rbmem_claims_v1(out, max_claims=10, forbid_kb_alias=True)
+    return out
+
+
+def _apply_claim_verdicts_to_rbmem_claims_v1(
+    *,
+    content: str,
+    run_id: str,
+    verdicts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Apply support/contra verdicts to claims and update statuses via a conservative state machine."""
+    doc = parse_rbmem_claims_v1(content)
+    claim_dicts: list[dict[str, Any]] = [dict(c.__dict__) for c in doc.claims]
+    by_id: dict[str, dict[str, Any]] = {str(c.get("claim_id") or ""): c for c in claim_dicts}
+
+    applied = 0
+    skipped_unknown_claim = 0
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        cid = str(v.get("claim_id") or "").strip()
+        verdict = str(v.get("verdict") or "").strip()
+        if not cid or verdict not in {"support", "contradict", "irrelevant"}:
+            continue
+        claim = by_id.get(cid)
+        if claim is None:
+            skipped_unknown_claim += 1
+            continue
+        if verdict == "irrelevant":
+            continue
+
+        key = "support" if verdict == "support" else "contra"
+        bucket = _ensure_dict(claim.get(key))
+        run_ids = _ensure_list_str(bucket.get("run_ids"))
+        if run_id not in run_ids:
+            run_ids.append(run_id)
+        bucket["run_ids"] = run_ids
+        bucket["count"] = len(run_ids)
+        claim[key] = bucket
+        applied += 1
+
+    # Conservative status update (claim-level; item can mix).
+    deleted: list[str] = []
+    for c in claim_dicts:
+        status = str(c.get("status") or "").strip()
+        support = _ensure_dict(c.get("support"))
+        contra = _ensure_dict(c.get("contra"))
+        support_ids = _ensure_list_str(support.get("run_ids"))
+        contra_ids = _ensure_list_str(contra.get("run_ids"))
+        support["run_ids"] = support_ids
+        contra["run_ids"] = contra_ids
+        support["count"] = int(support.get("count") or len(support_ids) or 0)
+        contra["count"] = int(contra.get("count") or len(contra_ids) or 0)
+        c["support"] = support
+        c["contra"] = contra
+
+        if status == "hypothesis" and int(support["count"]) >= 2 and int(contra["count"]) == 0:
+            c["status"] = "conclusion"
+        if status == "conclusion" and int(contra["count"]) >= 2:
+            c["status"] = "hypothesis"
+            lim = _ensure_list_str(c.get("limitations"))
+            msg = "contradicted_by_multiple_runs; consider adding conditions/limitations"
+            if msg not in lim:
+                lim.append(msg)
+            c["limitations"] = lim
+        # Optional deletion rule: if a hypothesis is repeatedly contradicted and never supported, drop it.
+        if status == "hypothesis" and int(support["count"]) == 0 and int(contra["count"]) >= 2:
+            deleted.append(str(c.get("claim_id") or ""))
+
+    if deleted and len(claim_dicts) > 1:
+        claim_dicts = [c for c in claim_dicts if str(c.get("claim_id") or "") not in set(deleted)]
+
+    out = _render_rbmem_claims_v1(topic=doc.topic, scope=doc.scope, claims=claim_dicts)
+    validate_rbmem_claims_v1(out, max_claims=10, forbid_kb_alias=True)
+    debug = {
+        "applied": int(applied),
+        "skipped_unknown_claim": int(skipped_unknown_claim),
+        "deleted_claim_ids": deleted,
+    }
+    return out, debug
 
 
 def _format_existing_memories(cfg: AppConfig, items: list[MemoryItem]) -> str:
@@ -1106,14 +1459,35 @@ def _system_prompt(cfg: AppConfig) -> str:
 
 
 def _dry_run_extract_items(run_id: str) -> list[dict[str, Any]]:
+    # Keep dry-run outputs compatible with the strict RBMEM_CLAIMS_V1 gate.
+    # This ensures end-to-end pipeline tests stay representative of real RB items.
     return [
         {
             "role": "global",
             "type": "reasoningbank_item",
             "content": (
-                "DRY RUN — synthetic ReasoningBank memory item.\n"
-                "Purpose: validate RB browse/learn/rollback pipeline.\n"
-                f"source_run_id={run_id}"
+                "RBMEM_CLAIMS_V1\n"
+                "TOPIC=DRY RUN synthetic RB item (pipeline validation)\n"
+                "SCOPE=global\n"
+                "CLAIMS_JSON="
+                + json.dumps(
+                    [
+                        {
+                            "claim_id": "c1",
+                            "status": "fact",
+                            "facts": {"source_run_ids": [run_id], "dry_run": True},
+                            "inference": {"summary": "Dry-run: validates RB browse/learn/rollback plumbing."},
+                            "constraint": {"avoid": [], "allow_positive": False},
+                            "conditions": [],
+                            "limitations": [],
+                            "support": {"count": 0, "run_ids": []},
+                            "contra": {"count": 0, "run_ids": []},
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
             ),
             "extra": {"dry_run": True, "confidence": 0.0, "tags": ["dry_run"]},
         },
@@ -1121,8 +1495,28 @@ def _dry_run_extract_items(run_id: str) -> list[dict[str, Any]]:
             "role": "orchestrator",
             "type": "reasoningbank_item",
             "content": (
-                "DRY RUN — synthetic orchestrator memory.\n"
-                "Do not use for science."
+                "RBMEM_CLAIMS_V1\n"
+                "TOPIC=DRY RUN orchestrator RB item (pipeline validation)\n"
+                "SCOPE=orchestrator\n"
+                "CLAIMS_JSON="
+                + json.dumps(
+                    [
+                        {
+                            "claim_id": "c1",
+                            "status": "fact",
+                            "facts": {"source_run_ids": [run_id], "dry_run": True},
+                            "inference": {"summary": "Dry-run: placeholder orchestrator memory. Do not use for science."},
+                            "constraint": {"avoid": [], "allow_positive": False},
+                            "conditions": [],
+                            "limitations": [],
+                            "support": {"count": 0, "run_ids": []},
+                            "contra": {"count": 0, "run_ids": []},
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
             ),
             "extra": {"dry_run": True, "confidence": 0.0, "tags": ["dry_run"]},
         },
@@ -1232,28 +1626,18 @@ def learn_reasoningbank_for_run(
             reason="auto_rollback_before_relearn",
         )
 
-    # Retrieval: a small set of existing active memories for de-duplication context.
-    query_seed = json.dumps(
-        {
-            "run_id": rid,
-            "run_output": run_output_json.get("recipes_json") or {},
-            "feedback": feedback_payload.get("feedback") or {},
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
+    # System FACTS digest (ground truth; used for both extraction + claim verdict updates).
+    facts_digest = _build_facts_digest(
+        run_id=rid,
+        run_output_json=run_output_json,
+        feedback_payload=feedback_payload,
     )
-    retrieved = rb.query(
-        query=query_seed,
-        n_results=10,
-        status=["active"],
-        role=None,
-        type=None,
-    )
-    retrieved_items = [cast(MemoryItem, r["item"]) for r in retrieved]
-    existing_context = _format_existing_memories(cfg, retrieved_items[:8])
 
     dry_run = _env_bool("C2XC_RB_LEARN_DRY_RUN", False)
     extracted_items: list[dict[str, Any]]
+    extracted_verdicts: list[dict[str, Any]] = []
+    candidate_mem_ids: list[str] = []
+    candidate_items: list[MemoryItem] = []
 
     if dry_run:
         extracted_items = _dry_run_extract_items(rid)
@@ -1262,13 +1646,26 @@ def learn_reasoningbank_for_run(
             raise RBLearnError("LLM is required for RB learn (set C2XC_RB_LEARN_DRY_RUN=1 for dry-run mode).")
 
         trace_digest = _build_run_trace_digest(store, snapshot=snapshot)
+
+        # Candidate memories: bounded set of existing items we allow to be updated via claim verdicts.
+        candidate_mem_ids = _collect_candidate_mem_ids(
+            cfg=cfg,
+            rb=rb,
+            run_output_json=run_output_json,
+            trace_digest=trace_digest,
+            facts_digest=facts_digest,
+        )
+        candidate_items = rb.get_many(mem_ids=candidate_mem_ids, include_content=True)
+        candidate_context = _format_existing_memories(cfg, candidate_items)
+
         prompt = render_template(
             cfg.reasoningbank.extract_prompt_template,
             {
                 "run_id": rid,
                 "run_output_json": json.dumps(run_output_json, ensure_ascii=False, indent=2),
                 "feedback_json": json.dumps(feedback_payload, ensure_ascii=False, indent=2),
-                "existing_memories_context": existing_context,
+                "facts_digest_json": json.dumps(facts_digest, ensure_ascii=False, indent=2),
+                "candidate_memories_context": candidate_context,
                 "run_trace_digest_json": json.dumps(trace_digest, ensure_ascii=False, indent=2),
             },
         ).strip()
@@ -1405,9 +1802,165 @@ def learn_reasoningbank_for_run(
 
         items_any = obj.get("items") if isinstance(obj, dict) else None
         extracted_items = items_any if isinstance(items_any, list) else []
+        verdicts_any = obj.get("verdicts") if isinstance(obj, dict) else None
+        extracted_verdicts = verdicts_any if isinstance(verdicts_any, list) else []
+
+        # One-shot format repair (best-effort): if the extractor output is JSON but items are invalid,
+        # ask the model to fix formatting only. This avoids polluting RB with malformed content.
+        issues: list[str] = []
+        for i, proposal in enumerate(extracted_items):
+            if not isinstance(proposal, dict):
+                continue
+            typ = str(proposal.get("type") or "").strip() or "reasoningbank_item"
+            content = str(proposal.get("content") or "").strip()
+            if not content:
+                issues.append(f"items[{i}].content: empty")
+                continue
+            if typ == "reasoningbank_item":
+                if not is_rbmem_claims_v1(content):
+                    issues.append(f"items[{i}].content: missing RBMEM_CLAIMS_V1 header")
+                else:
+                    try:
+                        validate_rbmem_claims_v1(content, max_claims=10, forbid_kb_alias=True)
+                    except RBMemClaimsV1ValidationError as e:
+                        detail = "; ".join(e.issues[:4]) if e.issues else str(e)
+                        issues.append(f"items[{i}].content: invalid RBMEM_CLAIMS_V1 ({detail})")
+
+        if issues:
+            fix_prompt = (
+                "Your previous JSON output was rejected by validation.\n"
+                "Fix FORMAT ONLY and return a single JSON object with the same keys: items, verdicts.\n"
+                "- Do not add commentary.\n"
+                "- Ensure reasoningbank_item.content is valid RBMEM_CLAIMS_V1.\n"
+                "- Do not include KB aliases like [C12].\n"
+                "- Do not include next-step experimental instructions in constraint.\n"
+                f"Validation issues: {json.dumps(issues[:12], ensure_ascii=False)}\n"
+                "Previous output (for editing):\n"
+                f"{raw_content}\n"
+            )
+            store.append_event(
+                rid,
+                "rb_llm_request",
+                {
+                    "ts": time.time(),
+                    "rb_job_id": rb_job_id,
+                    "purpose": "extract_format_fix",
+                    "model": getattr(llm, "model", None),
+                    "base_url": getattr(llm, "base_url", None),
+                    "temperature": 0.0,
+                },
+            )
+            fixed = llm.chat_messages(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": fix_prompt}],
+                temperature=0.0,
+                extra={},
+            )
+            store.append_event(
+                rid,
+                "rb_llm_response",
+                {
+                    "ts": time.time(),
+                    "rb_job_id": rb_job_id,
+                    "purpose": "extract_format_fix",
+                    "content": fixed.content,
+                    "raw": fixed.raw,
+                    "tool_calls": fixed.tool_calls,
+                },
+            )
+            try:
+                fixed_obj = extract_first_json_object(fixed.content)
+                fixed_items_any = fixed_obj.get("items") if isinstance(fixed_obj, dict) else None
+                extracted_items = fixed_items_any if isinstance(fixed_items_any, list) else extracted_items
+                fixed_verdicts_any = fixed_obj.get("verdicts") if isinstance(fixed_obj, dict) else None
+                extracted_verdicts = fixed_verdicts_any if isinstance(fixed_verdicts_any, list) else extracted_verdicts
+            except JSONExtractionError:
+                # Keep original output if the format-fix attempt fails.
+                pass
+
+    # Record delta ops for this learn job (includes verdict-driven updates + new additions/merges).
+    ops: list[dict[str, Any]] = []
+
+    # Phase A: apply claim verdict updates to candidate memories (bounded set).
+    candidate_by_id: dict[str, MemoryItem] = {it.mem_id: it for it in candidate_items}
+    verdicts_by_mem: dict[str, list[dict[str, Any]]] = {}
+    for v in extracted_verdicts:
+        if not isinstance(v, dict):
+            continue
+        mem_id = str(v.get("mem_id") or "").strip()
+        if not mem_id:
+            continue
+        verdicts_by_mem.setdefault(mem_id, []).append(v)
+
+    if verdicts_by_mem:
+        verdict_applied: dict[str, Any] = {"updated": 0, "skipped_non_candidate": 0, "skipped_invalid": 0}
+        for mem_id, vs in verdicts_by_mem.items():
+            existing = candidate_by_id.get(mem_id)
+            if existing is None:
+                verdict_applied["skipped_non_candidate"] = int(verdict_applied["skipped_non_candidate"]) + 1
+                continue
+            if not is_rbmem_claims_v1(existing.content):
+                verdict_applied["skipped_invalid"] = int(verdict_applied["skipped_invalid"]) + 1
+                continue
+
+            try:
+                new_content, debug = _apply_claim_verdicts_to_rbmem_claims_v1(
+                    content=existing.content,
+                    run_id=rid,
+                    verdicts=vs,
+                )
+            except Exception:
+                verdict_applied["skipped_invalid"] = int(verdict_applied["skipped_invalid"]) + 1
+                continue
+
+            if new_content.strip() == existing.content.strip():
+                continue
+
+            before = existing
+            after = rb.upsert(
+                mem_id=before.mem_id,
+                status=before.status,
+                role=before.role,
+                type=before.type,
+                content=new_content,
+                source_run_id=before.source_run_id,
+                schema_version=max(int(before.schema_version), 2),
+                extra=dict(before.extra or {}),
+                preserve_created_at=True,
+            )
+            _sync_rb_mem_index(store, after)
+            store.append_mem_edit_log(
+                mem_id=after.mem_id,
+                actor="rb_learn",
+                reason=f"claim_verdicts:{rb_job_id}",
+                before=_memory_to_dict(before),
+                after=_memory_to_dict(after),
+                extra={"debug": debug},
+            )
+            ops.append(
+                {
+                    "op": "update",
+                    "mem_id": after.mem_id,
+                    "before": _memory_to_dict(before),
+                    "after": _memory_to_dict(after),
+                    "reason": "claim_verdicts",
+                    "debug": debug,
+                }
+            )
+            verdict_applied["updated"] = int(verdict_applied["updated"]) + 1
+
+        store.append_event(
+            rid,
+            "rb_claim_verdicts_applied",
+            {
+                "ts": time.time(),
+                "rb_job_id": rb_job_id,
+                "summary": verdict_applied,
+                "n_verdicts": sum(len(v) for v in verdicts_by_mem.values()),
+                "n_candidate_items": len(candidate_items),
+            },
+        )
 
     # Consolidation + apply changes, record delta ops.
-    ops: list[dict[str, Any]] = []
     for proposal in extracted_items:
         if not isinstance(proposal, dict):
             continue
@@ -1417,6 +1970,42 @@ def learn_reasoningbank_for_run(
         extra = _ensure_dict(proposal.get("extra"))
         if not content:
             continue
+
+        # Hard gate + system FACTS injection for structured RB items.
+        if typ == "reasoningbank_item":
+            if not is_rbmem_claims_v1(content):
+                store.append_event(
+                    rid,
+                    "rb_item_rejected",
+                    {
+                        "ts": time.time(),
+                        "rb_job_id": rb_job_id,
+                        "reason": "missing_rbmem_claims_v1_header",
+                        "role": role,
+                        "type": typ,
+                    },
+                )
+                continue
+            try:
+                content = _inject_facts_into_rbmem_claims_v1(
+                    content=content,
+                    facts_digest=facts_digest,
+                    run_id=rid,
+                )
+            except (RBMemClaimsV1ParseError, RBMemClaimsV1ValidationError) as e:
+                store.append_event(
+                    rid,
+                    "rb_item_rejected",
+                    {
+                        "ts": time.time(),
+                        "rb_job_id": rb_job_id,
+                        "reason": "invalid_rbmem_claims_v1",
+                        "role": role,
+                        "type": typ,
+                        "error": str(e),
+                    },
+                )
+                continue
 
         # Find near-duplicate candidate in active memories within same role/type.
         dup_candidates = rb.query(query=content, n_results=3, status=["active"], role=[role], type=[typ])
@@ -1534,6 +2123,18 @@ def learn_reasoningbank_for_run(
                     }
                 )
 
+            # Safety: avoid poisoning the store with invalid structured content.
+            if chosen_existing.type == "reasoningbank_item":
+                if not is_rbmem_claims_v1(merged_content):
+                    merged_content = chosen_existing.content
+                    merge_used = False
+                else:
+                    try:
+                        validate_rbmem_claims_v1(merged_content, max_claims=10, forbid_kb_alias=True)
+                    except RBMemClaimsV1ValidationError:
+                        merged_content = chosen_existing.content
+                        merge_used = False
+
             before = chosen_existing
             after = rb.upsert(
                 mem_id=chosen_existing.mem_id,
@@ -1577,7 +2178,7 @@ def learn_reasoningbank_for_run(
             type=typ,
             content=content,
             source_run_id=rid,
-            schema_version=1,
+            schema_version=2 if typ == "reasoningbank_item" else 1,
             extra={
                 **extra,
                 "source_run_id": rid,

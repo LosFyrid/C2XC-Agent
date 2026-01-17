@@ -11,8 +11,9 @@ import {
   getRunEvent,
   getRunOutput,
   listRunEvents,
+  resolveRunModifierChecks,
 } from '../api/c2xc'
-import type { EventListItem, RunDetailResponse } from '../api/types'
+import type { EventListItem, ModifierCheckItem, RunDetailResponse } from '../api/types'
 import { CitationText } from '../components/CitationText'
 import { FeedbackTab } from '../components/FeedbackTab'
 import { ReasoningBankTab } from '../components/ReasoningBankTab'
@@ -56,6 +57,7 @@ const TRACE_EVENT_PRESETS = {
     'run_failed',
     'run_canceled',
     'final_output',
+    'modifier_checks',
     'rb_learn_queued',
     'rb_job_started',
     'rb_job_completed',
@@ -205,6 +207,15 @@ export function RunDetailPage() {
       if (err?.code === 'not_found') return 1500
       return false
     },
+  })
+
+  const modifierChecksQuery = useQuery({
+    queryKey: ['modifierChecks', runId],
+    queryFn: () => resolveRunModifierChecks(runId),
+    enabled: !!runId && Boolean(outputQuery.data),
+    // Don't spam PubChem; cache in react-query. Backend also caches in trace.
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
   })
 
   const citationEntries = useMemo(() => {
@@ -604,6 +615,9 @@ export function RunDetailPage() {
                   citationAliases={new Set(Object.keys(outputQuery.data?.citations ?? {}))}
                   knownMemIds={new Set(outputQuery.data?.memory_ids ?? [])}
                   onClickAlias={handleOpenEvidenceAlias}
+                  modifierChecks={modifierChecksQuery.data?.items ?? []}
+                  modifierChecksError={modifierChecksQuery.error as Error | null}
+                  modifierChecksLoading={modifierChecksQuery.isLoading}
                 />
 
                 <CitationsPanel
@@ -838,6 +852,9 @@ function StructuredRecipes(props: {
   citationAliases?: Set<string>
   knownMemIds?: Set<string>
   onClickAlias?: (alias: string) => void
+  modifierChecks?: ModifierCheckItem[]
+  modifierChecksLoading?: boolean
+  modifierChecksError?: Error | null
 }) {
   const obj = isRecord(props.recipesJson) ? props.recipesJson : {}
   const recipesRaw = obj['recipes']
@@ -845,6 +862,14 @@ function StructuredRecipes(props: {
   if (!recipes.length) return null
 
   const notes = readStringField(obj, 'overall_notes')?.trim() ?? ''
+  const checks = props.modifierChecks ?? []
+  const checksByQuery = useMemo(() => {
+    const m = new Map<string, ModifierCheckItem>()
+    for (const it of checks) {
+      if (it && typeof it.query === 'string') m.set(it.query, it)
+    }
+    return m
+  }, [checks])
 
   return (
     <div className="grid gap-3">
@@ -857,6 +882,7 @@ function StructuredRecipes(props: {
           const atomicRatio = readStringField(r, 'atomic_ratio') ?? ''
           const modifier = readStringField(r, 'small_molecule_modifier') ?? ''
           const rationale = readStringField(r, 'rationale') ?? ''
+          const check = modifier ? checksByQuery.get(modifier) ?? null : null
 
           return (
           <div key={idx} className="rounded-md border border-border bg-surface p-3 text-sm">
@@ -880,6 +906,61 @@ function StructuredRecipes(props: {
                 <span className="text-muted">small_molecule_modifier:</span>{' '}
                 <span className="font-mono">{modifier || '—'}</span>
               </div>
+              {modifier ? (
+                <div className="mt-1 rounded-md border border-border bg-bg p-2 text-[11px]">
+                  <div className="mb-1 flex items-center justify-between">
+                    <div className="text-muted">PubChem / COOH check</div>
+                    {props.modifierChecksLoading ? (
+                      <div className="text-muted">loading…</div>
+                    ) : props.modifierChecksError ? (
+                      <div className="text-danger">error</div>
+                    ) : null}
+                  </div>
+                  {check ? (
+                    <div className="grid gap-1">
+                      <div>
+                        <span className="text-muted">status:</span>{' '}
+                        <span className="font-mono">{check.status}</span>
+                        {check.status === 'resolved' ? (
+                          <>
+                            {' · '}
+                            <span className="text-muted">CID:</span>{' '}
+                            <span className="font-mono">{check.cid ?? '—'}</span>
+                          </>
+                        ) : null}
+                      </div>
+                      {check.has_cooh === true ? (
+                        <div className="text-success">
+                          COOH: <span className="font-mono">true</span>
+                        </div>
+                      ) : check.has_cooh === false ? (
+                        <div className="text-danger">
+                          COOH: <span className="font-mono">false</span> (建议人工打回/重生成)
+                        </div>
+                      ) : (
+                        <div className="text-muted">
+                          COOH: <span className="font-mono">unknown</span>
+                        </div>
+                      )}
+                      {check.canonical_smiles ? (
+                        <div className="break-words">
+                          <span className="text-muted">SMILES:</span>{' '}
+                          <span className="font-mono">{check.canonical_smiles}</span>
+                        </div>
+                      ) : null}
+                      {check.error ? (
+                        <div className="text-muted">
+                          <span className="text-muted">note:</span> {check.error}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : props.modifierChecksLoading ? (
+                    <div className="text-muted">Loading modifier checks…</div>
+                  ) : (
+                    <div className="text-muted">No modifier check result.</div>
+                  )}
+                </div>
+              ) : null}
             </div>
             {rationale ? (
               <div className="mt-3 text-xs text-fg">

@@ -66,6 +66,22 @@ export type RunOutputResponse = {
   memory_ids: string[]
 }
 
+export type ModifierCheckItem = {
+  query: string
+  normalized_query: string
+  status: string
+  cid: number | null
+  canonical_smiles: string | null
+  inchikey: string | null
+  has_cooh: boolean | null
+  error: string | null
+}
+
+export type ModifierChecksResponse = {
+  run_id: string
+  items: ModifierCheckItem[]
+}
+
 export type EventListItem = {
   event_id: string
   run_id: string
