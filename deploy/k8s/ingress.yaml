@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: c2xc-ingress
+  namespace: custom-app
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - "c2xc-agent.pic-aichem.online"
+      secretName: "custom-app-tls-secret"
+  rules:
+    - host: "c2xc-agent.pic-aichem.online"
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: c2xc
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: c2xc
+                port:
+                  number: 80

@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Minimal OS packages: keep lean; no build toolchain required for the pinned wheels.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps (include HKU LightRAG; import name remains `lightrag`).

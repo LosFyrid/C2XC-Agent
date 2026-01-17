@@ -1,54 +1,60 @@
 apiVersion: v1
-kind: Namespace
+kind: PersistentVolumeClaim
 metadata:
-  name: c2xc
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: c2xc-secrets
-  namespace: c2xc
-type: Opaque
-stringData:
-  # TODO: Replace with your real keys.
-  OPENAI_API_KEY: "__REPLACE_OPENAI_API_KEY__"
-  C2XC_EMBEDDING_API_KEY: "__REPLACE_C2XC_EMBEDDING_API_KEY__"
+  name: c2xc-agent-backend-data
+  labels:
+    app: c2xc-agent
+  annotations:
+    # 不因 Git 中移除/重命名而被 prune 删除
+    kustomize.toolkit.fluxcd.io/prune: disabled
+    # 仅在资源不存在时创建；后续不再尝试对 PVC 做 apply（避免不可变字段报错）
+    kustomize.toolkit.fluxcd.io/ssa: IfNotPresent
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 10Gi
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: c2xc-backend
-  namespace: c2xc
+  name: c2xc
+  namespace: custom-app
 spec:
   type: ClusterIP
   selector:
-    app: c2xc-backend
+    app: c2xc-agent
   ports:
-    - name: http
+    - name: http-api
       port: 8000
       targetPort: 8000
+    - name: http-web
+      port: 80
+      targetPort: 8080
 ---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
-  name: c2xc-backend
+  name: c2xc-agent
   namespace: c2xc
 spec:
-  serviceName: c2xc-backend
   replicas: 1
   selector:
     matchLabels:
-      app: c2xc-backend
+      app: c2xc-agent
   template:
     metadata:
       labels:
-        app: c2xc-backend
+        app: c2xc-agent
     spec:
-      # Single-tenant/single-instance assumption: pin to one node that has the hostPath data + KB.
-      # TODO: Replace with a real k3s node name (see `kubectl get nodes -o wide`).
-      nodeName: "__REPLACE_NODE_NAME__"
-
       terminationGracePeriodSeconds: 30
+
+      # Frontend needs writable emptyDir mounts for nginx; fsGroup ensures group write.
+      securityContext:
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
 
       initContainers:
         - name: init-data-dir
@@ -65,15 +71,17 @@ spec:
             runAsUser: 0
             runAsGroup: 0
           volumeMounts:
-            - name: c2xc-data
+            - name: c2xc-agent-backend-data
               mountPath: /app/data
 
       containers:
         - name: backend
-          image: c2xc-agent-backend:__TAG__
-          imagePullPolicy: IfNotPresent
+          image: harbor.pic-aichem.online/sunyk/c2xc-agent-backend:v0.2
+          imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
           ports:
-            - name: http
+            - name: http-api
               containerPort: 8000
           env:
             # --- Service behavior
@@ -94,55 +102,51 @@ spec:
 
             # --- Knowledge Bases (hostPath)
             - name: LIGHTRAG_KB_PRINCIPLES_DIR
-              value: "/app/kb/kb_principles"
+              value: "/app/data/lightrag"
             - name: LIGHTRAG_KB_MODULATION_DIR
-              value: "/app/kb/kb_modulation"
+              value: "/app/data/lightrag"
 
             # --- LLM (OpenAI-compatible)
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: c2xc-secrets
+                  name: c2xc-agent-api-key
                   key: OPENAI_API_KEY
             - name: OPENAI_API_BASE
-              value: "__REPLACE_OPENAI_API_BASE__"
+              value: "https://dashscope.aliyuncs.com/compatible-mode/v1"
             - name: LLM_MODEL
-              value: "__REPLACE_LLM_MODEL__"
+              value: "qwen-plus"
             # Optional (provider-specific): enable hybrid-thinking for Qwen via compatible gateways.
             - name: C2XC_LLM_ENABLE_THINKING
               value: "0"
 
             # --- Embeddings (OpenAI-compatible; can differ from chat gateway)
             - name: C2XC_EMBEDDING_API_BASE
-              value: "__REPLACE_C2XC_EMBEDDING_API_BASE__"
+              value: "https://dashscope.aliyuncs.com/compatible-mode/v1"
             - name: C2XC_EMBEDDING_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: c2xc-secrets
+                  name: c2xc-agent-api-key
                   key: C2XC_EMBEDDING_API_KEY
             - name: C2XC_EMBEDDING_MODEL
-              value: "__REPLACE_C2XC_EMBEDDING_MODEL__"
+              value: "text-embedding-v4"
             - name: C2XC_EMBEDDING_DIM
-              value: "__REPLACE_C2XC_EMBEDDING_DIM__"
+              value: "2048"
             # Only some providers support `dimensions`; keep off by default.
             - name: C2XC_EMBEDDING_SEND_DIMENSIONS
               value: "0"
 
             # --- ReasoningBank
-            - name: C2XC_RB_EMBEDDING_MODE
-              value: "openai"
+            #- name: C2XC_RB_EMBEDDING_MODE
+            #  value: "openai"
             # Optional: different model/base for RB learn (extract/merge).
-            - name: C2XC_RB_LEARN_LLM_MODEL
-              value: "__REPLACE_C2XC_RB_LEARN_LLM_MODEL__"
-            - name: C2XC_RB_LEARN_OPENAI_API_BASE
-              value: "__REPLACE_C2XC_RB_LEARN_OPENAI_API_BASE__"
+            #- name: C2XC_RB_LEARN_LLM_MODEL
+            #  value: "__REPLACE_C2XC_RB_LEARN_LLM_MODEL__"
+            #- name: C2XC_RB_LEARN_OPENAI_API_BASE
+            #  value: "__REPLACE_C2XC_RB_LEARN_OPENAI_API_BASE__"
             # Optional: allow RB learn to run without LLM (offline testing).
-            - name: C2XC_RB_LEARN_DRY_RUN
-              value: "0"
-
-            # --- CORS (only needed if frontend is on a different origin)
-            - name: C2XC_CORS_ORIGINS
-              value: "https://__REPLACE_DOMAIN__"
+            #- name: C2XC_RB_LEARN_DRY_RUN
+            #  value: "0"
             # Some libraries write caches/temp files; keep them off the container root fs.
             - name: TMPDIR
               value: "/tmp"
@@ -150,16 +154,10 @@ spec:
               value: "/tmp/.cache"
 
           volumeMounts:
-            - name: c2xc-data
+            - name: c2xc-agent-backend-data
               mountPath: /app/data
-            - name: tmp
+            - name: tmp-data
               mountPath: /tmp
-            - name: c2xc-kb-principles
-              mountPath: /app/kb/kb_principles
-              readOnly: true
-            - name: c2xc-kb-modulation
-              mountPath: /app/kb/kb_modulation
-              readOnly: true
 
           readinessProbe:
             httpGet:
@@ -195,63 +193,13 @@ spec:
             capabilities:
               drop: ["ALL"]
 
-      volumes:
-        - name: c2xc-data
-          hostPath:
-            path: /var/lib/c2xc/data
-            type: DirectoryOrCreate
-        - name: tmp
-          emptyDir: {}
-        - name: c2xc-kb-principles
-          hostPath:
-            path: /var/lib/c2xc/kb/kb_principles
-            type: Directory
-        - name: c2xc-kb-modulation
-          hostPath:
-            path: /var/lib/c2xc/kb/kb_modulation
-            type: Directory
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: c2xc-frontend
-  namespace: c2xc
-spec:
-  type: ClusterIP
-  selector:
-    app: c2xc-frontend
-  ports:
-    - name: http
-      port: 80
-      targetPort: 8080
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: c2xc-frontend
-  namespace: c2xc
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: c2xc-frontend
-  template:
-    metadata:
-      labels:
-        app: c2xc-frontend
-    spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 101
-        runAsGroup: 101
-        fsGroup: 101
-        fsGroupChangePolicy: OnRootMismatch
-      containers:
         - name: frontend
-          image: c2xc-agent-frontend:__TAG__
-          imagePullPolicy: IfNotPresent
+          image: harbor.pic-aichem.online/sunyk/c2xc-agent-frontend:v0.2
+          imagePullPolicy: Always
+          imagePullSecrets: 
+            - name: harbor-auth
           ports:
-            - name: http
+            - name: http-web
               containerPort: 8080
           volumeMounts:
             - name: nginx-cache
@@ -266,44 +214,22 @@ spec:
               cpu: "1000m"
               memory: "512Mi"
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+
       volumes:
+        - name: c2xc-agent-backend-data
+          persistentVolumeClaim:
+            claimName: c2xc-agent-backend-data
         - name: nginx-cache
           emptyDir: {}
         - name: nginx-run
           emptyDir: {}
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: c2xc-ingress
-  namespace: c2xc
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-spec:
-  ingressClassName: traefik
-  tls:
-    - hosts:
-        - "__REPLACE_DOMAIN__"
-      secretName: "__REPLACE_TLS_SECRET__"
-  rules:
-    - host: "__REPLACE_DOMAIN__"
-      http:
-        paths:
-          - path: /api
-            pathType: Prefix
-            backend:
-              service:
-                name: c2xc-backend
-                port:
-                  number: 8000
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: c2xc-frontend
-                port:
-                  number: 80
+        - name: tmp-data
+          emptyDir: {}
+

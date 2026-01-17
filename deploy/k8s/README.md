@@ -1,26 +1,31 @@
-# C2XC-Agent on k3s (single-tenant, hostPath, pinned node)
+# C2XC-Agent on Kubernetes/k3s (single-tenant, hostPath)
 
 This deployment matches the repo's current *single-instance* runtime model:
 
-- One backend Pod (FastAPI + in-process worker thread)
-- One frontend Pod (static WebUI)
+- One Pod (single Deployment) with 2 containers:
+  - backend (FastAPI + in-process worker thread)
+  - frontend (static WebUI)
 - One Traefik Ingress (single domain, TLS)
-- Persistence via **hostPath** on a specific node (no migration; "crash → restart on same node")
+- Persistence via **hostPath** (no migration; "crash → restart on same node")
 
-## 0) Pick a backend node (pinning)
+## 0) Multi-node clusters (optional pinning)
 
-1) List nodes:
+This manifest uses `hostPath`. If your cluster has multiple nodes, you must either:
+
+- copy the hostPath directories to every node, or
+- pin the Deployment to one node (recommended).
+
+List nodes:
 
 ```bash
 kubectl get nodes -o wide
 ```
 
-2) Pick exactly one node to host:
+Pick exactly one node to host:
 - SQLite + Chroma data directory
 - The two LightRAG KB working dirs
 
-3) In `deploy/k3s/c2xc-agent.yaml`, replace:
-- `__REPLACE_NODE_NAME__`
+Then add a `nodeSelector` (or `nodeName`) under the Deployment in `deploy/k8s/c2xc-agent.yaml`.
 
 ## 1) Prepare directories on the pinned node
 
@@ -83,13 +88,13 @@ sudo k3s ctr images import c2xc-agent-frontend.tar.gz
 
 ## 4) Configure secrets + domain + TLS
 
-Edit `deploy/k3s/c2xc-agent.yaml` and replace:
+Edit `deploy/k8s/secret.yaml` and replace the placeholder API keys.
+
+Edit `deploy/k8s/c2xc-agent.yaml` and replace:
 
 - `__REPLACE_DOMAIN__`
 - `__REPLACE_TLS_SECRET__`
-- `__REPLACE_OPENAI_API_KEY__`
-- `__REPLACE_C2XC_EMBEDDING_API_KEY__` (if needed)
-- all `__REPLACE_*__` env vars for your gateways/models
+- `__TAG__` (backend + frontend images)
 
 Create a TLS secret (example):
 
@@ -104,13 +109,14 @@ kubectl -n c2xc create secret tls __REPLACE_TLS_SECRET__ --cert=fullchain.pem --
 Copy the yaml to the k3s server manifests directory:
 
 ```bash
-sudo cp deploy/k3s/c2xc-agent.yaml /var/lib/rancher/k3s/server/manifests/c2xc-agent.yaml
+sudo cp deploy/k8s/c2xc-agent.yaml /var/lib/rancher/k3s/server/manifests/c2xc-agent.yaml
 ```
 
 ### Option B (kubectl apply)
 
 ```bash
-kubectl apply -f deploy/k3s/c2xc-agent.yaml
+kubectl apply -f deploy/k8s/secret.yaml
+kubectl apply -f deploy/k8s/c2xc-agent.yaml
 ```
 
 ## 6) Smoke checks
@@ -127,4 +133,3 @@ Check backend:
 curl -k https://__REPLACE_DOMAIN__/api/v1/healthz
 curl -k https://__REPLACE_DOMAIN__/api/v1/version
 ```
-
