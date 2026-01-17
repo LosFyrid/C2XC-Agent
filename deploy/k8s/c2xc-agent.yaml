@@ -27,7 +27,7 @@ spec:
       targetPort: 8000
     - name: http-web
       port: 80
-      targetPort: 80
+      targetPort: 8080
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -76,7 +76,7 @@ spec:
           imagePullSecrets: 
             - name: harbor-auth
           ports:
-            - name: http
+            - name: http-api
               containerPort: 8000
           env:
             # --- Service behavior
@@ -193,7 +193,7 @@ spec:
             - name: harbor-auth
           ports:
             - name: http-web
-              containerPort: 80
+              containerPort: 8080
           volumeMounts:
             - name: nginx-cache
               mountPath: /var/cache/nginx
