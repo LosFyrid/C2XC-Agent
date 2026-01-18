@@ -17,7 +17,7 @@ set -euo pipefail
 # - Requires `docker` and an authenticated `docker login harbor.pic-aichem.online`.
 # - Frontend reads API base at build time (Vite); default is `/api/v1`.
 
-TAG="${TAG:-v0.2}"
+TAG="${TAG:-v0.2.3}"
 BACKEND_REPO="${BACKEND_REPO:-harbor.pic-aichem.online/sunyk/c2xc-agent-backend}"
 FRONTEND_REPO="${FRONTEND_REPO:-harbor.pic-aichem.online/sunyk/c2xc-agent-frontend}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-/api/v1}"

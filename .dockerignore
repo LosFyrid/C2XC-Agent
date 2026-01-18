@@ -19,3 +19,5 @@ frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+
+.git/

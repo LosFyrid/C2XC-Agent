@@ -1,5 +1,7 @@
 FROM python:3.13-slim AS runtime
 
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -13,8 +15,8 @@ RUN apt-get update \
 
 # Install Python deps (include HKU LightRAG; import name remains `lightrag`).
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --no-cache-dir -U pip \
-    && python -m pip install --no-cache-dir -r /app/requirements.txt "lightrag-hku==1.4.9.10"
+RUN python -m pip install --no-cache-dir -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && python -m pip install --no-cache-dir -r /app/requirements.txt "lightrag-hku==1.4.9.10" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Copy runtime code + config + priors.
 COPY src /app/src
