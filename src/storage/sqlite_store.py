@@ -1095,16 +1095,20 @@ class SQLiteStore:
 
     # --- Evidence (KB alias -> chunk mapping; aggregated from trace)
     def _collect_run_evidence(self, *, run_id: str) -> dict[str, dict[str, Any]]:
-        """Aggregate per-run evidence from `kb_query` events.
+        """Aggregate per-run evidence from trace events.
 
         Evidence is stored inside trace events (append-only). For UI performance,
-        we expose a read API that aggregates alias -> chunk information.
+        we expose a read API that aggregates alias -> evidence information.
+
+        Currently supported evidence event types:
+        - kb_query (LightRAG chunk evidence; aliases like C1)
+        - pubchem_query (PubChem evidence; aliases like P1)
         """
         rows = self._conn.execute(
             """
             SELECT created_at, event_id, payload_json
             FROM events
-            WHERE run_id = ? AND event_type = 'kb_query'
+            WHERE run_id = ? AND event_type IN ('kb_query', 'pubchem_query')
             ORDER BY created_at ASC, event_id ASC;
             """,
             (run_id,),

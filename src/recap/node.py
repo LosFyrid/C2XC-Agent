@@ -22,6 +22,9 @@ class Node:
         self.role = role
         self.info_list: list[RecapInfo] = []
         self.obs_list: list[str] = []
+        # Strict acceptance: count how many times this node failed deliverable validation
+        # (e.g., missing required mechanisms/roles). Used to cap repair loops.
+        self.accept_failures: int = 0
 
     def add_child(self, child: "Node") -> None:
         self.children.append(child)

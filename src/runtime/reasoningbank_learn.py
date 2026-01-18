@@ -374,8 +374,8 @@ def _rb_learn_deref_tools_schema() -> list[dict[str, Any]]:
             "function": {
                 "name": "rb_open_evidence",
                 "description": (
-                    "Open KB evidence chunk text by alias (e.g. C12) or canonical ref (kb:...). "
-                    "This returns the original chunk content recorded during the run."
+                    "Open run evidence text by alias (e.g. C12 or P3) or canonical ref (kb:.../pubchem:...). "
+                    "This returns the original evidence content recorded during the run."
                 ),
                 "parameters": {
                     "type": "object",
@@ -845,7 +845,7 @@ def _find_kb_evidence_in_run(
             run_id=run_id,
             limit=200,
             cursor=cursor,
-            event_types=["kb_query"],
+            event_types=["kb_query", "pubchem_query"],
             include_payload=True,
             since=None,
             until=float(trace_cutoff_ts),
@@ -908,7 +908,7 @@ def _deref_open_evidence(ctx: _RBLearnDerefContext, args: dict[str, Any]) -> dic
         ref=ref if ref else None,
     )
     if found is None:
-        out = _tool_error(code="not_found", message="Evidence not found in run trace (kb_query).")
+        out = _tool_error(code="not_found", message="Evidence not found in run trace (kb_query/pubchem_query).")
         out_s = json.dumps(out, ensure_ascii=False)
         ctx.budget._consume(full=False, n_chars=len(out_s))
         _append_rb_source_opened(

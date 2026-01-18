@@ -2,6 +2,17 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.2.3 (2026-01-18)
+
+- New: Strict expert deliverable acceptance (schema + coverage) with automatic repair loops (configurable via `recap.acceptance_max_repairs`)
+  - `tio2_expert` must cover all 7 mechanisms (`tio2_mechanisms_report_v1`, allowing `negligible|na` with justification).
+  - `mof_expert` must cover all 10 roles (`mof_roles_report_v1`, allowing `negligible|na` with justification).
+  - Root `generate_recipes` is blocked until both experts pass acceptance (prevents "claimed verification" without evidence).
+- New: Agent-facing PubChem evidence registry with citeable aliases `[P#]`
+  - Primitive action: `type="pubchem"` (supports `resolve|property_table|pug_view_toc|pug_view_section`)
+  - generate_recipes tools: `pubchem_query`, `pubchem_list`, `pubchem_get`
+  - Evidence API now aggregates both KB evidence (`kb_query`, `[C#]`) and PubChem evidence (`pubchem_query`, `[P#]`).
+
 ## v0.2.2 (2026-01-17)
 
 - Fixed: `/api/v1/runs/{run_id}/modifier_checks` no longer crashes due to `sqlite3.Row` lacking `.get()` (PubChem panel 500).
@@ -14,7 +25,7 @@ This project currently has no tagged releases. Version labels below follow commi
 
 - Improved: WebUI long-text readability and traceability
   - Trace/JSON viewer: long string fields are expandable (with a rendered view + copy).
-  - Evidence viewer: evidence chunks render Markdown + safe HTML (e.g. `<sub>/<sup>`) with a Raw fallback view.
+  - Evidence viewer: evidence chunks render Markdown + safe HTML (e.g. `<sub>/<sup>`) + LaTeX math (`$...$`/`$$...$$`), with a Raw fallback view.
   - JSON Tree: object/array nodes support "Show more"/"Show all" to reveal previously hidden keys/items.
   - Output: recipe rationales and `overall_notes` render Markdown while preserving clickable citation aliases.
 

@@ -15,6 +15,9 @@ from src.tools.citation_aliases import (
 from src.utils.json_extract import JSONExtractionError, extract_first_json_object
 from src.utils.template import render_template
 
+from src.tools.pubchem import PubChemEvidence, fetch_pubchem_evidence
+
+from .acceptance import validate_expert_deliverable
 from .node import Node, RecapInfo
 from .state import RecapState
 
@@ -33,6 +36,7 @@ _ALLOWED_KB_MODES = {"mix", "local", "global", "hybrid", "naive"}
 _ALLOWED_MEM_ROLES = {"global", "orchestrator", "mof_expert", "tio2_expert"}
 _ALLOWED_MEM_STATUSES = {"active", "archived"}
 _ALLOWED_MEM_TYPES = {"reasoningbank_item", "manual_note"}
+_ALLOWED_PUBCHEM_OPS = {"resolve", "property_table", "pug_view_toc", "pug_view_section"}
 
 
 # Structured output schema for ReCAP planning/refinement calls.
@@ -121,6 +125,19 @@ _RECAP_RESPONSE_FORMAT: dict[str, Any] = {
                                     "limit": {"type": "integer", "minimum": 1},
                                 },
                                 "required": ["type"],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "type": {"const": "pubchem"},
+                                    "op": {"type": "string", "enum": sorted(_ALLOWED_PUBCHEM_OPS)},
+                                    "query": {"type": "string"},
+                                    "cid": {"type": "integer", "minimum": 1},
+                                    "heading": {"type": "string"},
+                                    "properties": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["type", "op"],
                             },
                             {
                                 "type": "object",
@@ -331,12 +348,59 @@ def _parse_subtask(item: Any) -> dict[str, Any]:
             out["limit"] = limit
         return out
 
+    if stype == "pubchem":
+        op = str(item.get("op") or "").strip()
+        if op not in _ALLOWED_PUBCHEM_OPS:
+            raise JSONExtractionError(
+                f"Invalid pubchem.op: must be one of {sorted(_ALLOWED_PUBCHEM_OPS)}, got {op!r}"
+            )
+        query = str(item.get("query") or "").strip()
+        cid: int | None = None
+        if item.get("cid") is not None:
+            try:
+                cid = int(item.get("cid"))
+            except Exception as e:
+                raise JSONExtractionError(f"Invalid pubchem.cid: {item.get('cid')!r}") from e
+            if cid < 1:
+                raise JSONExtractionError(f"Invalid pubchem.cid: must be >=1, got {cid}")
+        if not query and cid is None:
+            raise JSONExtractionError("Invalid pubchem: provide at least one of {query, cid}")
+
+        heading: str | None = None
+        if item.get("heading") is not None:
+            heading = str(item.get("heading") or "").strip() or None
+        if op == "pug_view_section" and not heading:
+            raise JSONExtractionError("Invalid pubchem: heading is required for op='pug_view_section'")
+
+        properties: list[str] | None = None
+        if item.get("properties") is not None:
+            raw_props = item.get("properties")
+            if not isinstance(raw_props, list):
+                raise JSONExtractionError("Invalid pubchem.properties: expected array of strings")
+            cleaned: list[str] = []
+            for p in raw_props:
+                s = str(p or "").strip()
+                if s:
+                    cleaned.append(s)
+            properties = cleaned or None
+
+        out2: dict[str, Any] = {"type": "pubchem", "op": op}
+        if query:
+            out2["query"] = query
+        if cid is not None:
+            out2["cid"] = cid
+        if heading:
+            out2["heading"] = heading
+        if properties is not None:
+            out2["properties"] = properties
+        return out2
+
     if stype == "generate_recipes":
         return {"type": "generate_recipes"}
 
     raise JSONExtractionError(
         "Invalid subtask.type: must be one of "
-        "['task','kb_search','kb_get','kb_list','mem_search','mem_get','mem_list','generate_recipes'], "
+        "['task','kb_search','kb_get','kb_list','mem_search','mem_get','mem_list','pubchem','generate_recipes'], "
         f"got {stype!r}"
     )
 
@@ -445,6 +509,18 @@ class _RuntimeState:
     # Last kb_search aliases (fallback when nothing was focused yet)
     last_kb_search_aliases: list[str]
 
+    # PubChem evidence registry (aliases like P1, P2...).
+    pubchem_alias_map: dict[str, str]  # alias -> canonical pubchem ref (pubchem:...)
+    pubchem_all_items: list[dict[str, Any]]  # unique, in first-seen order
+    pubchem_alias_to_item: dict[str, dict[str, Any]]  # alias -> evidence payload (content + raw_json snapshot)
+    pubchem_next_index: int
+    pubchem_dedup: dict[str, str]  # stable_key -> alias (avoid repeated external calls)
+
+    # Focused PubChem aliases (cited inline as [P#] or opened via pubchem_get).
+    pubchem_focus_aliases: list[str]
+    pubchem_focus_seen: set[str]
+    last_pubchem_aliases: list[str]
+
     # Memory registry (ReasoningBank): mem_id -> memory item.
     mem_all_items: list[MemoryItem]  # unique, in first-seen order
     mem_id_to_item: dict[str, MemoryItem]
@@ -456,11 +532,17 @@ class _RuntimeState:
     # Last mem_search results (fallback when nothing was focused yet)
     last_mem_search_ids: list[str]
 
+    # Strict acceptance records for expert deliverables (role -> acceptance_record_v1).
+    acceptance_by_role: dict[str, dict[str, Any]]
 
-def _merge_focus_aliases(rt: _RuntimeState, aliases: list[str]) -> None:
+
+def _merge_focus_kb_aliases(rt: _RuntimeState, aliases: list[str]) -> None:
     for a in aliases:
         alias = (a or "").strip()
         if not alias:
+            continue
+        # PubChem evidence uses [P#]; keep focus sets separate.
+        if alias.startswith("P"):
             continue
         if alias in rt.kb_focus_seen:
             continue
@@ -477,6 +559,19 @@ def _merge_focus_mem_ids(rt: _RuntimeState, mem_ids: list[str]) -> None:
             continue
         rt.mem_focus_seen.add(mem_id)
         rt.mem_focus_ids.append(mem_id)
+
+
+def _merge_focus_pubchem_aliases(rt: _RuntimeState, aliases: list[str]) -> None:
+    for a in aliases:
+        alias = (a or "").strip()
+        if not alias:
+            continue
+        if not alias.startswith("P"):
+            continue
+        if alias in rt.pubchem_focus_seen:
+            continue
+        rt.pubchem_focus_seen.add(alias)
+        rt.pubchem_focus_aliases.append(alias)
 
 
 class RecapEngine:
@@ -522,7 +617,8 @@ class RecapEngine:
                     "User request:\n"
                     f"{user_request}\n\n"
                     f"recipes_per_run={ctx.recipes_per_run}\n"
-                    "You must retrieve evidence before generate_recipes (kb_search for literature and/or mem_search for memories)."
+                    "You must retrieve evidence before generate_recipes "
+                    "(kb_search for literature and/or mem_search for memories and/or PubChem evidence when relevant)."
                 ),
             }
         )
@@ -546,12 +642,199 @@ class RecapEngine:
             kb_focus_aliases=[],
             kb_focus_seen=set(),
             last_kb_search_aliases=[],
+            pubchem_alias_map={},
+            pubchem_all_items=[],
+            pubchem_alias_to_item={},
+            pubchem_next_index=1,
+            pubchem_dedup={},
+            pubchem_focus_aliases=[],
+            pubchem_focus_seen=set(),
+            last_pubchem_aliases=[],
             mem_all_items=[],
             mem_id_to_item={},
             mem_focus_ids=[],
             mem_focus_seen=set(),
             last_mem_search_ids=[],
+            acceptance_by_role={},
         )
+
+        def _pubchem_request_key(
+            *,
+            op: str,
+            query: str,
+            cid: int | None,
+            heading: str | None,
+            properties: list[str] | None,
+        ) -> str:
+            cid_part = str(int(cid)) if cid is not None else "none"
+            heading_part = (heading or "").strip().lower()
+            props_part = ",".join(
+                sorted([str(p).strip().lower() for p in (properties or []) if str(p).strip()])
+            )
+            query_part = (query or "").strip().lower()
+            op_part = str(op or "").strip()
+            return f"op={op_part}|cid={cid_part}|heading={heading_part}|props={props_part}|q={query_part}"
+
+        def _register_pubchem_evidence(
+            rt: _RuntimeState,
+            ctx: Any,
+            ev: PubChemEvidence,
+            *,
+            request_key: str | None = None,
+        ) -> tuple[str, dict[str, Any], bool]:
+            """Store a PubChemEvidence payload into the run evidence registry (aliases like P1).
+
+            Returns:
+              - alias
+              - stored item dict (includes content + raw snapshot)
+              - is_new (False on dedup hit)
+            """
+
+            def _dedup_key(e: PubChemEvidence) -> str:
+                # Keep simple + stable. CID-based where possible to avoid name ambiguities.
+                cid_part = str(int(e.cid)) if e.cid is not None else "none"
+                heading_part = (e.heading or "").strip().lower()
+                props_part = ",".join(sorted([str(p).strip().lower() for p in (e.properties or []) if str(p).strip()]))
+                query_part = (e.query or "").strip().lower()
+                return f"op={e.op}|cid={cid_part}|heading={heading_part}|props={props_part}|q={query_part}"
+
+            key = _dedup_key(ev)
+            existing = rt.pubchem_dedup.get(key)
+            if existing and existing in rt.pubchem_alias_to_item:
+                return existing, rt.pubchem_alias_to_item[existing], False
+
+            alias = f"P{rt.pubchem_next_index}"
+            rt.pubchem_next_index += 1
+
+            # Canonical ref: stable, machine-readable string for linking.
+            cid_s = str(ev.cid) if ev.cid is not None else ""
+            if ev.op == "property_table":
+                props = ",".join([str(p).strip() for p in (ev.properties or []) if str(p).strip()])
+                ref = f"pubchem:pug_rest/compound/cid/{cid_s}/property/{props}"
+            elif ev.op == "pug_view_section":
+                heading = (ev.heading or "").strip()
+                ref = f"pubchem:pug_view/data/compound/{cid_s}/JSON?heading={heading}"
+            elif ev.op == "pug_view_toc":
+                ref = f"pubchem:pug_view/data/compound/{cid_s}/JSON#toc"
+            elif ev.op == "resolve":
+                ref = f"pubchem:pug_rest/compound/name/{(ev.query or '').strip()}/cids/JSON"
+            else:
+                ref = f"pubchem:op/{ev.op}/cid/{cid_s}"
+
+            def _format_content(e: PubChemEvidence) -> str:
+                lines: list[str] = []
+                lines.append("PubChem evidence (best-effort; may be condition-dependent):")
+                lines.append(f"- status: {e.status}")
+                if e.query:
+                    lines.append(f"- query: {e.query}")
+                if e.cid is not None:
+                    lines.append(f"- cid: {e.cid}")
+                lines.append(f"- op: {e.op}")
+                if e.heading:
+                    lines.append(f"- heading: {e.heading}")
+                if e.properties:
+                    lines.append(f"- properties: {', '.join(e.properties)}")
+                if e.error:
+                    lines.append(f"- error: {e.error}")
+                if e.raw_truncated:
+                    lines.append("- raw_json: truncated")
+                lines.append("")
+
+                extracted = e.extracted
+                if isinstance(extracted, dict):
+                    # Show a small, readable subset.
+                    for k in sorted(extracted.keys()):
+                        v = extracted.get(k)
+                        if isinstance(v, list):
+                            lines.append(f"{k}:")
+                            for s in v[:20]:
+                                ss = str(s).strip()
+                                if len(ss) > 220:
+                                    ss = ss[:220] + "…"
+                                lines.append(f"- {ss}")
+                            if len(v) > 20:
+                                lines.append(f"(+{len(v) - 20} more)")
+                        else:
+                            vs = str(v)
+                            if len(vs) > 400:
+                                vs = vs[:400] + "…"
+                            lines.append(f"{k}: {vs}")
+                    return "\n".join(lines).strip()
+
+                if isinstance(extracted, list):
+                    lines.append("extracted:")
+                    for s in extracted[:25]:
+                        ss = str(s).strip()
+                        if len(ss) > 220:
+                            ss = ss[:220] + "…"
+                        lines.append(f"- {ss}")
+                    if len(extracted) > 25:
+                        lines.append(f"(+{len(extracted) - 25} more)")
+                    return "\n".join(lines).strip()
+
+                lines.append("(no extracted content)")
+                return "\n".join(lines).strip()
+
+            item: dict[str, Any] = {
+                "alias": alias,
+                "ref": ref,
+                "source": "PubChem",
+                "content": _format_content(ev),
+                # Reuse evidence fields for UI compatibility.
+                "kb_namespace": "pubchem",
+                "lightrag_chunk_id": None,
+                "created_at": _now_ts(),
+                # Extra fields (optional for UI; useful for audit/debug).
+                "status": ev.status,
+                "op": ev.op,
+                "cid": ev.cid,
+                "query": ev.query,
+                "heading": ev.heading,
+                "properties": ev.properties,
+                "extracted": ev.extracted,
+                "raw_json": ev.raw_json,
+                "raw_truncated": ev.raw_truncated,
+                "error": ev.error,
+            }
+
+            rt.pubchem_alias_map[alias] = ref
+            rt.pubchem_alias_to_item[alias] = item
+            rt.pubchem_all_items.append(item)
+            rt.pubchem_dedup[key] = alias
+            if request_key:
+                rt.pubchem_dedup.setdefault(str(request_key), alias)
+            rt.last_pubchem_aliases = [alias]
+
+            ctx.trace(
+                "pubchem_query",
+                {
+                    "ts": _now_ts(),
+                    "agent": rt.node_ptr.role,
+                    "op": ev.op,
+                    "query": ev.query,
+                    "cid": ev.cid,
+                    "heading": ev.heading,
+                    "properties": ev.properties,
+                    "status": ev.status,
+                    "results": [
+                        {
+                            "alias": item["alias"],
+                            "ref": item["ref"],
+                            "source": item["source"],
+                            "content": item["content"],
+                            "kb_namespace": item["kb_namespace"],
+                            "lightrag_chunk_id": item["lightrag_chunk_id"],
+                            # Preserve the raw/extracted payload for later inspection.
+                            "extracted": item["extracted"],
+                            "raw_json": item["raw_json"],
+                            "raw_truncated": item["raw_truncated"],
+                            "error": item["error"],
+                        }
+                    ],
+                },
+            )
+
+            return alias, item, True
 
         def _resolve_mem_tokens(mem_tokens: list[str]) -> tuple[list[str], list[str], dict[str, list[str]]]:
             """Resolve mem tokens (full UUIDs or hex prefixes) into full mem_ids in the run registry.
@@ -623,7 +906,7 @@ class RecapEngine:
             if not isinstance(recipes, list) or len(recipes) != int(ctx.recipes_per_run):
                 raise RecapError(f"Invalid recipe count. Expected exactly {ctx.recipes_per_run}.")
 
-            # Validate per-recipe citation presence (KB alias [C1] or memory mem:<id>).
+            # Validate per-recipe citation presence (KB alias [C1], PubChem alias [P1], or memory mem:<id>).
             missing_citations = 0
             for r in recipes:
                 if not isinstance(r, dict):
@@ -634,7 +917,7 @@ class RecapEngine:
             if missing_citations:
                 raise RecapError(
                     "Each recipe rationale must include at least one inline citation. "
-                    "Use either a KB alias like [C2] or a memory id like mem:<uuid>."
+                    "Use either a KB alias like [C2], a PubChem alias like [P3], or a memory id like mem:<uuid>."
                 )
 
             text_dump = json.dumps(obj, ensure_ascii=False)
@@ -642,15 +925,19 @@ class RecapEngine:
             mem_tokens = extract_memory_ids(text_dump)
 
             if not used_aliases and not mem_tokens:
-                raise RecapError("No citations found in final output (KB alias [C#] or mem:<id>).")
+                raise RecapError(
+                    "No citations found in final output (KB alias [C#], PubChem alias [P#], or mem:<id>)."
+                )
 
-            # Resolve KB aliases.
+            # Resolve evidence aliases (KB + PubChem).
             try:
-                citations = resolve_aliases(used_aliases, rt.kb_alias_map)
+                alias_map: dict[str, str] = dict(rt.kb_alias_map)
+                alias_map.update(rt.pubchem_alias_map)
+                citations = resolve_aliases(used_aliases, alias_map)
             except KeyError as e:
                 raise RecapError(
                     f"Unknown citation alias in output: {e}. "
-                    "Only cite aliases that exist in the run evidence registry (see index / kb_list)."
+                    "Only cite aliases that exist in the run evidence registry (see index / kb_list / pubchem_list)."
                 ) from e
 
             # Resolve + validate memory tokens.
@@ -821,8 +1108,12 @@ class RecapEngine:
 
             # Any inline citations used in intermediate reasoning/results are treated as "focused"
             # evidence, so the final generation prompt can stay small.
-            _merge_focus_aliases(rt, extract_citation_aliases(info.think))
-            _merge_focus_aliases(rt, extract_citation_aliases(info.result))
+            think_aliases = extract_citation_aliases(info.think)
+            result_aliases = extract_citation_aliases(info.result)
+            _merge_focus_kb_aliases(rt, think_aliases)
+            _merge_focus_kb_aliases(rt, result_aliases)
+            _merge_focus_pubchem_aliases(rt, think_aliases)
+            _merge_focus_pubchem_aliases(rt, result_aliases)
             _merge_focus_mem_ids(rt, extract_memory_ids(info.think))
             _merge_focus_mem_ids(rt, extract_memory_ids(info.result))
 
@@ -855,6 +1146,53 @@ class RecapEngine:
                     rt.remaining_subtasks = []
                     rt.state = RecapState.ACTION_TAKEN
                     continue
+
+                # Strict acceptance for expert deliverables:
+                # - tio2_expert: must cover all 7 mechanisms (allowing negligible/na with justification)
+                # - mof_expert: must cover all 10 roles (allowing negligible/na with justification)
+                if rt.node_ptr.parent is not None and rt.node_ptr.role in {"tio2_expert", "mof_expert"}:
+                    max_repairs = int(getattr(cfg.recap, "acceptance_max_repairs", 3))
+                    attempt_idx = int(getattr(rt.node_ptr, "accept_failures", 0)) + 1
+                    try:
+                        parsed_report = extract_first_json_object(info.result)
+                        if not isinstance(parsed_report, dict):
+                            parsed_report = {
+                                "schema": "",
+                                "_parse_error": "result JSON must be an object",
+                            }
+                    except Exception as e:
+                        parsed_report = {"schema": "", "_parse_error": str(e)}
+
+                    outcome = validate_expert_deliverable(
+                        role=rt.node_ptr.role,
+                        report_obj=parsed_report,
+                        max_repairs=max_repairs,
+                        attempt_idx=attempt_idx,
+                    )
+                    ctx.trace(
+                        "acceptance_record",
+                        {
+                            "ts": _now_ts(),
+                            "agent": rt.node_ptr.role,
+                            "task_name": rt.node_ptr.task_name,
+                            **outcome.acceptance_record,
+                        },
+                    )
+                    if not outcome.accepted:
+                        rt.node_ptr.accept_failures = attempt_idx
+                        if rt.node_ptr.accept_failures >= max_repairs:
+                            raise RecapError(
+                                f"Strict acceptance failed for role={rt.node_ptr.role} after "
+                                f"{rt.node_ptr.accept_failures}/{max_repairs} repair attempts. "
+                                "See acceptance_record events for details."
+                            )
+                        rt.latest_obs = outcome.repair_message or "ERROR: acceptance failed (missing repair message)."
+                        rt.remaining_subtasks = []
+                        rt.state = RecapState.ACTION_TAKEN
+                        continue
+
+                    # Accepted: store for root gating ("do not generate recipes until both experts passed").
+                    rt.acceptance_by_role[rt.node_ptr.role] = outcome.acceptance_record
 
                 # Task done; backtrack to parent (or error if root ends without final generation).
                 if rt.node_ptr.parent is None:
@@ -911,11 +1249,29 @@ class RecapEngine:
                     rt.state = RecapState.ACTION_TAKEN
                     continue
 
+                # Strict gating: do not generate recipes until both experts have passed acceptance.
+                missing_roles: list[str] = []
+                for required in ("tio2_expert", "mof_expert"):
+                    rec = rt.acceptance_by_role.get(required)
+                    if not isinstance(rec, dict) or not bool(rec.get("accepted")):
+                        missing_roles.append(required)
+                if missing_roles:
+                    rt.latest_obs = (
+                        "ERROR: generate_recipes is blocked by strict acceptance.\n"
+                        "Missing accepted expert deliverables for roles: "
+                        f"{missing_roles}\n"
+                        "You MUST delegate to these experts and obtain a passing deliverable (see role instructions) "
+                        "before generating final recipes."
+                    )
+                    rt.remaining_subtasks = info.subtasks[1:]
+                    rt.state = RecapState.ACTION_TAKEN
+                    continue
+
                 # Final generation primitive.
-                if not rt.kb_all_aliased_chunks and not rt.mem_all_items:
+                if not rt.kb_all_aliased_chunks and not rt.mem_all_items and not rt.pubchem_all_items:
                     raise RecapError(
                         "generate_recipes requires prior evidence: run kb_search (KB literature) and/or "
-                        "mem_search (ReasoningBank) first."
+                        "mem_search (ReasoningBank) and/or pubchem first."
                     )
 
                 # generate_recipes is a *process*: we provide a compact evidence index, and the model can
@@ -995,12 +1351,57 @@ class RecapEngine:
                         lines.append(f"mem:{it.mem_id} role={it.role} type={it.type} status={it.status} :: {snippet}")
                     return "\n".join(lines).strip()
 
+                def _build_pubchem_index() -> str:
+                    total = len(rt.pubchem_all_items)
+                    default_limit = int(cfg.evidence.kb_list_default_limit)
+                    max_limit = int(cfg.evidence.kb_list_max_limit)
+                    limit = min(max(default_limit, 1), max_limit)
+
+                    focused = [a for a in rt.pubchem_focus_aliases if a in rt.pubchem_alias_to_item]
+                    recent = [a for a in rt.last_pubchem_aliases if a in rt.pubchem_alias_to_item]
+                    ordered: list[str] = []
+                    seen: set[str] = set()
+                    for a in focused + recent:
+                        if a in seen:
+                            continue
+                        seen.add(a)
+                        ordered.append(a)
+                    for it in rt.pubchem_all_items:
+                        alias = str(it.get("alias") or "").strip()
+                        if not alias or alias in seen:
+                            continue
+                        seen.add(alias)
+                        ordered.append(alias)
+
+                    shown = ordered[:limit]
+                    lines: list[str] = []
+                    lines.append(
+                        f"Total PubChem evidence items in run registry: {total}. Showing {len(shown)}/{total} aliases."
+                    )
+                    lines.append("Use pubchem_list to view more, pubchem_get to open full content by alias.")
+                    if total == 0:
+                        lines.append("(empty; use pubchem primitive actions earlier in the run)")
+                    lines.append("")
+                    for alias in shown:
+                        item = rt.pubchem_alias_to_item.get(alias)
+                        if item is None:
+                            continue
+                        source = str(item.get("source") or "").strip()
+                        op = str(item.get("op") or "").strip()
+                        heading = str(item.get("heading") or "").strip()
+                        suffix = f" op={op}" if op else ""
+                        if heading:
+                            suffix += f" heading={heading}"
+                        lines.append(f"[{alias}] source={source}{suffix}")
+                    return "\n".join(lines).strip()
+
                 gen_prompt = render_template(
                     cfg.prompts.generate_recipes_prompt_template,
                     {
                         "user_request": user_request,
                         "recipes_per_run": ctx.recipes_per_run,
                         "kb_evidence_index": _build_evidence_index(),
+                        "pubchem_evidence_index": _build_pubchem_index(),
                         "mem_evidence_index": _build_mem_index(),
                     },
                 )
@@ -1026,6 +1427,53 @@ class RecapEngine:
                             "parameters": {
                                 "type": "object",
                                 "properties": {"limit": {"type": "integer"}},
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pubchem_get",
+                            "description": (
+                                "Fetch full PubChem evidence content for an alias (e.g. P3) from the run evidence registry."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"alias": {"type": "string"}},
+                                "required": ["alias"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pubchem_list",
+                            "description": "List available PubChem evidence aliases (and sources) currently stored in the run evidence registry.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"limit": {"type": "integer"}},
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pubchem_query",
+                            "description": (
+                                "Query PubChem (PUG REST / PUG-View) for numeric/experimental evidence and store it "
+                                "as a citeable alias like [P1]. Use before stating numeric values when possible."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "op": {"type": "string"},
+                                    "query": {"type": "string"},
+                                    "cid": {"type": "integer"},
+                                    "heading": {"type": "string"},
+                                    "properties": {"type": "array", "items": {"type": "string"}},
+                                    "timeout_s": {"type": "number"},
+                                },
+                                "required": ["op"],
                             },
                         },
                     },
@@ -1072,6 +1520,7 @@ class RecapEngine:
                 # Safety: cap how many full chunks can be injected via kb_get during generation.
                 max_full = int(cfg.evidence.max_full_chunks_in_generate_recipes)
                 opened_aliases: set[str] = set()
+                opened_pubchem_aliases: set[str] = set()
                 max_full_mem = int(cfg.reasoningbank.max_full_memories_in_generate_recipes)
                 opened_mem_ids: set[str] = set()
 
@@ -1163,7 +1612,7 @@ class RecapEngine:
                                     )
                                 else:
                                     opened_aliases.add(alias)
-                                    _merge_focus_aliases(rt, [stored.alias])
+                                    _merge_focus_kb_aliases(rt, [stored.alias])
                                     tool_obs = (
                                         "KB get (from run evidence registry):\n"
                                         f"[{stored.alias}] source={stored.source}\n"
@@ -1217,6 +1666,153 @@ class RecapEngine:
                                         "shown_aliases": [a.alias for a in shown],
                                     },
                                 )
+                            elif name == "pubchem_get":
+                                alias = str(args.get("alias") or "").strip()
+                                if alias.startswith("[") and alias.endswith("]"):
+                                    alias = alias[1:-1].strip()
+
+                                stored = rt.pubchem_alias_to_item.get(alias)
+                                if stored is None:
+                                    tool_obs = (
+                                        f"ERROR: Unknown PubChem alias: {alias!r}.\n"
+                                        "You can only pubchem_get an alias that exists in the run evidence registry."
+                                    )
+                                elif alias not in opened_pubchem_aliases and len(opened_pubchem_aliases) >= max_full:
+                                    tool_obs = (
+                                        "ERROR: pubchem_get limit reached for generate_recipes.\n"
+                                        f"Already opened {len(opened_pubchem_aliases)}/{max_full} full items; "
+                                        "use the evidence you already opened or narrow your needs."
+                                    )
+                                else:
+                                    opened_pubchem_aliases.add(alias)
+                                    _merge_focus_pubchem_aliases(rt, [alias])
+                                    tool_obs = (
+                                        "PubChem get (from run evidence registry):\n"
+                                        f"[{alias}] source={stored.get('source')}\n"
+                                        f"{stored.get('content')}\n"
+                                    ).strip()
+                                    ctx.trace(
+                                        "pubchem_get",
+                                        {
+                                            "ts": _now_ts(),
+                                            "agent": "orchestrator",
+                                            "context": "generate_recipes",
+                                            "alias": alias,
+                                            "ref": stored.get("ref"),
+                                            "cid": stored.get("cid"),
+                                            "op": stored.get("op"),
+                                            "heading": stored.get("heading"),
+                                            "properties": stored.get("properties"),
+                                        },
+                                    )
+                            elif name == "pubchem_list":
+                                total = len(rt.pubchem_all_items)
+                                default_limit = int(cfg.evidence.kb_list_default_limit)
+                                max_limit = int(cfg.evidence.kb_list_max_limit)
+                                try:
+                                    limit = int(args.get("limit")) if args.get("limit") is not None else default_limit
+                                except Exception:
+                                    limit = default_limit
+                                if limit < 1:
+                                    limit = 1
+                                if limit > max_limit:
+                                    limit = max_limit
+
+                                shown = rt.pubchem_all_items[:limit]
+                                lines = [f"PubChem evidence registry: {total} items total."]
+                                if total == 0:
+                                    lines.append("(empty; call pubchem_query or run pubchem primitive actions)")
+                                else:
+                                    lines.append(f"Showing {len(shown)}/{total} (limit={limit}).")
+                                    lines.append("")
+                                    for it in shown:
+                                        a = str(it.get("alias") or "").strip()
+                                        s = str(it.get("source") or "").strip()
+                                        op = str(it.get("op") or "").strip()
+                                        heading = str(it.get("heading") or "").strip()
+                                        suffix = f" op={op}" if op else ""
+                                        if heading:
+                                            suffix += f" heading={heading}"
+                                        lines.append(f"[{a}] source={s}{suffix}")
+                                tool_obs = "\n".join(lines).strip()
+                                ctx.trace(
+                                    "pubchem_list",
+                                    {
+                                        "ts": _now_ts(),
+                                        "agent": "orchestrator",
+                                        "context": "generate_recipes",
+                                        "total": total,
+                                        "limit": limit,
+                                        "shown_aliases": [str(it.get("alias") or "").strip() for it in shown],
+                                    },
+                                )
+                            elif name == "pubchem_query":
+                                # This mirrors the primitive `pubchem` action but is available during final generation.
+                                op = str(args.get("op") or "").strip()
+                                query = str(args.get("query") or "").strip()
+                                heading = str(args.get("heading") or "").strip() or None
+                                props_raw = args.get("properties")
+                                props: list[str] | None = None
+                                if isinstance(props_raw, list):
+                                    props = [str(p or "").strip() for p in props_raw if str(p or "").strip()] or None
+                                cid: int | None = None
+                                if args.get("cid") is not None:
+                                    try:
+                                        cid = int(args.get("cid"))
+                                    except Exception:
+                                        cid = None
+                                timeout_s = 8.0
+                                if args.get("timeout_s") is not None:
+                                    try:
+                                        timeout_s = float(args.get("timeout_s"))
+                                    except Exception:
+                                        timeout_s = 8.0
+
+                                req_key = _pubchem_request_key(
+                                    op=op,
+                                    query=query,
+                                    cid=cid,
+                                    heading=heading,
+                                    properties=props,
+                                )
+                                cached_alias = rt.pubchem_dedup.get(req_key)
+                                cached_item = rt.pubchem_alias_to_item.get(cached_alias) if cached_alias else None
+                                if cached_alias and cached_item is not None:
+                                    tool_obs = (
+                                        "PubChem query result (cache hit; stored in run evidence registry):\n"
+                                        f"[{cached_alias}] status={cached_item.get('status')} op={op}"
+                                        + (f" heading={heading}" if heading else "")
+                                        + "\n\n"
+                                        f"{cached_item.get('content')}\n"
+                                    ).strip()
+                                    ctx.trace(
+                                        "pubchem_cache_hit",
+                                        {
+                                            "ts": _now_ts(),
+                                            "agent": "orchestrator",
+                                            "context": "generate_recipes",
+                                            "alias": cached_alias,
+                                            "request_key": req_key,
+                                        },
+                                    )
+                                else:
+                                    ev = fetch_pubchem_evidence(
+                                        query=query,
+                                        cid=cid,
+                                        op=op,
+                                        heading=heading,
+                                        properties=props,
+                                        timeout_s=timeout_s,
+                                    )
+                                    alias, item, is_new = _register_pubchem_evidence(rt, ctx, ev, request_key=req_key)
+                                    # For tool output, show the alias + a short excerpt so the model can decide what to cite.
+                                    tool_obs = (
+                                        "PubChem query result (stored in run evidence registry):\n"
+                                        f"[{alias}] status={ev.status} cid={ev.cid} op={ev.op}"
+                                        + (f" heading={ev.heading}" if ev.heading else "")
+                                        + "\n\n"
+                                        f"{item.get('content')}\n"
+                                    ).strip()
                             elif name == "mem_search":
                                 if ctx.rb is None:
                                     tool_obs = (
@@ -1650,7 +2246,7 @@ class RecapEngine:
                         "You can only kb_get an alias that was returned by a prior kb_search in this run."
                     )
                 else:
-                    _merge_focus_aliases(rt, [stored.alias])
+                    _merge_focus_kb_aliases(rt, [stored.alias])
                     rt.latest_obs = (
                         "KB get (from run evidence registry):\n"
                         f"[{stored.alias}] source={stored.source}\n"
@@ -1932,6 +2528,68 @@ class RecapEngine:
                 rt.state = RecapState.ACTION_TAKEN
                 continue
 
+            if stype == "pubchem":
+                op = str(first.get("op") or "").strip()
+                query = str(first.get("query") or "").strip()
+                heading = str(first.get("heading") or "").strip() or None
+                cid: int | None = None
+                if first.get("cid") is not None:
+                    try:
+                        cid = int(first.get("cid"))
+                    except Exception:
+                        cid = None
+                props = first.get("properties")
+                properties: list[str] | None = None
+                if isinstance(props, list):
+                    properties = [str(p or "").strip() for p in props if str(p or "").strip()] or None
+
+                req_key = _pubchem_request_key(
+                    op=op,
+                    query=query,
+                    cid=cid,
+                    heading=heading,
+                    properties=properties,
+                )
+                cached_alias = rt.pubchem_dedup.get(req_key)
+                cached_item = rt.pubchem_alias_to_item.get(cached_alias) if cached_alias else None
+                if cached_alias and cached_item is not None:
+                    alias = cached_alias
+                    item = cached_item
+                    status = str(item.get("status") or "ok")
+                    rt.latest_obs = (
+                        "PubChem action completed (cache hit; evidence already in run registry):\n"
+                        f"[{alias}] status={status} op={op}"
+                        + (f" heading={heading}" if heading else "")
+                        + "\n\n"
+                        f"{item.get('content')}\n"
+                    ).strip()
+                    rt.remaining_subtasks = info.subtasks[1:]
+                    rt.state = RecapState.ACTION_TAKEN
+                    continue
+
+                ev = fetch_pubchem_evidence(
+                    query=query,
+                    cid=cid,
+                    op=op,
+                    heading=heading,
+                    properties=properties,
+                    timeout_s=8.0,
+                )
+                alias, item, _is_new = _register_pubchem_evidence(rt, ctx, ev, request_key=req_key)
+
+                # Observation: keep it short + citeable.
+                rt.latest_obs = (
+                    "PubChem action completed (evidence stored in run registry):\n"
+                    f"[{alias}] status={ev.status} cid={ev.cid} op={ev.op}"
+                    + (f" heading={ev.heading}" if ev.heading else "")
+                    + "\n\n"
+                    f"{item.get('content')}\n"
+                ).strip()
+
+                rt.remaining_subtasks = info.subtasks[1:]
+                rt.state = RecapState.ACTION_TAKEN
+                continue
+
             if stype == "task":
                 role = str(first.get("role") or "orchestrator").strip() or "orchestrator"
                 task = str(first.get("task") or "").strip()
@@ -1954,7 +2612,7 @@ class RecapEngine:
             # Should not happen (parser validates), but keep a safe fallback.
             rt.latest_obs = (
                 "ERROR: Unknown subtask type. Expected one of "
-                "['task','kb_search','kb_get','kb_list','mem_search','mem_get','mem_list','generate_recipes'].\n"
+                "['task','kb_search','kb_get','kb_list','mem_search','mem_get','mem_list','pubchem','generate_recipes'].\n"
                 f"Got: {json.dumps(first, ensure_ascii=False)}"
             )
             rt.remaining_subtasks = info.subtasks[1:]
