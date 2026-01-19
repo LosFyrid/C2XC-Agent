@@ -2,6 +2,14 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.2.5 (2026-01-19)
+
+- Fixed: ReasoningBank learn now enforces a retrievable claim anchor (`inference.summary` must be non-empty for every claim).
+- Improved: RB extractor prompt now includes an explicit RBMEM_CLAIMS_V1 claim schema (prevents unsupported fields like `statement`/`confidence` being dropped by the parser).
+- Changed: RB learn role policy defaults learned items to `global` unless the extractor provides an explicit `extra.role_specific_reason`.
+  - Adds `rb_role_policy_override` trace event when a non-global role is requested without justification.
+- Improved: PubChem usage guidance is now embedded in prompts/tool descriptions (e.g., pKa via `pug_view_section` + heading `Dissociation Constants`; materials like doped TiO2 often cannot resolve CID).
+
 ## v0.2.4 (2026-01-19)
 
 - Improved: Memory UI for new RB item format (`RBMEM_CLAIMS_V1`)

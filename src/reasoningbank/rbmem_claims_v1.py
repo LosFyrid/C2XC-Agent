@@ -258,6 +258,18 @@ def validate_rbmem_claims_v1(
 
     # Claim-level validations.
     for i, claim in enumerate(doc.claims):
+        # Retrieval anchor: enforce a non-empty natural-language summary.
+        #
+        # Why: ReasoningBank semantic retrieval is claim-centric. If inference.summary is empty,
+        # the derived claim docs become embedding "shells" that are effectively unsearchable.
+        summary = ""
+        if isinstance(claim.inference, dict):
+            summary = str(claim.inference.get("summary") or "").strip()
+        if not summary:
+            issues.append(
+                f"CLAIMS_JSON[{i}].inference.summary: missing/empty (required; put the claim statement here)."
+            )
+
         if contains_kb_alias(json.dumps(claim.__dict__, ensure_ascii=False)):
             issues.append(f"CLAIMS_JSON[{i}]: contains KB alias tokens like [C*].")
         _validate_constraint(
@@ -326,4 +338,3 @@ def claim_text_projection(claim: RBMemClaimV1, *, max_chars: int = 700) -> str:
     if len(text) > max_chars:
         return text[: max_chars - 3] + "..."
     return text
-

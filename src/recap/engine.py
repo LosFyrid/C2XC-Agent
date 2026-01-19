@@ -1455,17 +1455,23 @@ class RecapEngine:
                             },
                         },
                     },
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "pubchem_query",
-                            "description": (
-                                "Query PubChem (PUG REST / PUG-View) for numeric/experimental evidence and store it "
-                                "as a citeable alias like [P1]. Use before stating numeric values when possible."
-                            ),
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
+	                    {
+	                        "type": "function",
+	                        "function": {
+	                            "name": "pubchem_query",
+	                            "description": (
+	                                "Query PubChem (PUG REST / PUG-View) for numeric/experimental evidence and store it "
+	                                "as a citeable alias like [P1]. Use before stating numeric values when possible.\n\n"
+	                                "Usage tips:\n"
+	                                "- op='property_table' for standard compound descriptors (e.g., MolecularWeight, ExactMass, XLogP, TPSA, "
+	                                "HBondDonorCount/HBondAcceptorCount, counts, InChIKey, SMILES).\n"
+	                                "- op='pug_view_section' for experimental properties (often NOT available via property_table): "
+	                                "pKa => heading='Dissociation Constants'; solubility => heading='Solubility'; melting point => heading='Melting Point'.\n"
+	                                "- PubChem often cannot resolve materials (e.g., doped TiO2); fall back to kb_search when unresolved."
+	                            ),
+	                            "parameters": {
+	                                "type": "object",
+	                                "properties": {
                                     "op": {"type": "string"},
                                     "query": {"type": "string"},
                                     "cid": {"type": "integer"},

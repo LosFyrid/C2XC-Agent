@@ -1282,6 +1282,30 @@ def _ensure_list_str(value: Any) -> list[str]:
     return out
 
 
+def _apply_rb_role_policy(*, requested_role: str, typ: str, extra: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """Apply a conservative role policy for learned memories.
+
+    Policy (user request):
+    - Default to role="global" for reuse.
+    - Only keep a non-global role when the extractor provides an explicit justification.
+    """
+    role_norm = (requested_role or "").strip() or "global"
+    if role_norm == "global":
+        return "global", None
+
+    # Preserve role in dry-run plumbing to avoid surprising test harnesses.
+    if bool(extra.get("dry_run") is True):
+        return role_norm, None
+
+    # Require an explicit justification to prevent accidental role fragmentation
+    # (which can make mem_search look "empty" to other agents).
+    reason = str(extra.get("role_specific_reason") or "").strip()
+    if not reason:
+        return "global", {"requested_role": role_norm, "applied_role": "global", "why": "missing_role_specific_reason"}
+
+    return role_norm, None
+
+
 def _best_effort_similarity(distance: float | None) -> float | None:
     """Convert Chroma distance into a similarity-like score.
 
@@ -1826,18 +1850,20 @@ def learn_reasoningbank_for_run(
                         detail = "; ".join(e.issues[:4]) if e.issues else str(e)
                         issues.append(f"items[{i}].content: invalid RBMEM_CLAIMS_V1 ({detail})")
 
-        if issues:
-            fix_prompt = (
-                "Your previous JSON output was rejected by validation.\n"
-                "Fix FORMAT ONLY and return a single JSON object with the same keys: items, verdicts.\n"
-                "- Do not add commentary.\n"
-                "- Ensure reasoningbank_item.content is valid RBMEM_CLAIMS_V1.\n"
-                "- Do not include KB aliases like [C12].\n"
-                "- Do not include next-step experimental instructions in constraint.\n"
-                f"Validation issues: {json.dumps(issues[:12], ensure_ascii=False)}\n"
-                "Previous output (for editing):\n"
-                f"{raw_content}\n"
-            )
+            if issues:
+                fix_prompt = (
+                    "Your previous JSON output was rejected by validation.\n"
+                    "Fix FORMAT ONLY and return a single JSON object with the same keys: items, verdicts.\n"
+                    "- Do not add commentary.\n"
+                    "- Ensure reasoningbank_item.content is valid RBMEM_CLAIMS_V1.\n"
+                    "- Each claim MUST include inference: {\"summary\": \"...\"} with a non-empty summary (put the claim statement there).\n"
+                    "- Do not include KB aliases like [C12].\n"
+                    "- Do not include next-step experimental instructions in constraint.\n"
+                    "- Do not use non-schema fields like 'statement'/'confidence' inside CLAIMS_JSON.\n"
+                    f"Validation issues: {json.dumps(issues[:12], ensure_ascii=False)}\n"
+                    "Previous output (for editing):\n"
+                    f"{raw_content}\n"
+                )
             store.append_event(
                 rid,
                 "rb_llm_request",
@@ -1964,12 +1990,20 @@ def learn_reasoningbank_for_run(
     for proposal in extracted_items:
         if not isinstance(proposal, dict):
             continue
-        role = str(proposal.get("role") or "").strip() or "global"
         typ = str(proposal.get("type") or "").strip() or "reasoningbank_item"
         content = str(proposal.get("content") or "").strip()
         extra = _ensure_dict(proposal.get("extra"))
         if not content:
             continue
+
+        requested_role = str(proposal.get("role") or "").strip() or "global"
+        role, role_debug = _apply_rb_role_policy(requested_role=requested_role, typ=typ, extra=extra)
+        if role_debug is not None:
+            store.append_event(
+                rid,
+                "rb_role_policy_override",
+                {"ts": time.time(), "rb_job_id": rb_job_id, "type": typ, **role_debug},
+            )
 
         # Hard gate + system FACTS injection for structured RB items.
         if typ == "reasoningbank_item":
