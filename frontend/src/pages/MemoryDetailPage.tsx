@@ -4,6 +4,7 @@ import { Link, useParams } from 'react-router-dom'
 import { ApiError } from '../api/client'
 import { archiveMemory, getMemory, patchMemory } from '../api/c2xc'
 import { JsonViewer } from '../components/JsonViewer'
+import { MemoryContentViewer } from '../components/MemoryContentViewer'
 import { useT } from '../i18n/i18n'
 
 function formatTs(ts: number | null): string {
@@ -222,7 +223,7 @@ export function MemoryDetailPage() {
                 ) : null}
               </div>
             ) : (
-              <div className="mt-3 whitespace-pre-wrap text-sm text-fg">{memory.content}</div>
+              <MemoryContentViewer memory={memory} />
             )}
           </section>
 
@@ -235,4 +236,3 @@ export function MemoryDetailPage() {
     </div>
   )
 }
-

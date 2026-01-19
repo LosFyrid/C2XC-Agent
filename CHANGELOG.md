@@ -2,6 +2,12 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.2.4 (2026-01-19)
+
+- Improved: Memory UI for new RB item format (`RBMEM_CLAIMS_V1`)
+  - Adds a structured "claims" view (list + details) and keeps a Raw fallback.
+  - Memory list prefers RB-generated `extra.notes` for previews (avoids huge JSON snippets).
+
 ## v0.2.3 (2026-01-18)
 
 - New: Strict expert deliverable acceptance (schema + coverage) with automatic repair loops (configurable via `recap.acceptance_max_repairs`)
