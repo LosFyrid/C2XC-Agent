@@ -1850,20 +1850,20 @@ def learn_reasoningbank_for_run(
                         detail = "; ".join(e.issues[:4]) if e.issues else str(e)
                         issues.append(f"items[{i}].content: invalid RBMEM_CLAIMS_V1 ({detail})")
 
-            if issues:
-                fix_prompt = (
-                    "Your previous JSON output was rejected by validation.\n"
-                    "Fix FORMAT ONLY and return a single JSON object with the same keys: items, verdicts.\n"
-                    "- Do not add commentary.\n"
-                    "- Ensure reasoningbank_item.content is valid RBMEM_CLAIMS_V1.\n"
-                    "- Each claim MUST include inference: {\"summary\": \"...\"} with a non-empty summary (put the claim statement there).\n"
-                    "- Do not include KB aliases like [C12].\n"
-                    "- Do not include next-step experimental instructions in constraint.\n"
-                    "- Do not use non-schema fields like 'statement'/'confidence' inside CLAIMS_JSON.\n"
-                    f"Validation issues: {json.dumps(issues[:12], ensure_ascii=False)}\n"
-                    "Previous output (for editing):\n"
-                    f"{raw_content}\n"
-                )
+        if issues:
+            fix_prompt = (
+                "Your previous JSON output was rejected by validation.\n"
+                "Fix FORMAT ONLY and return a single JSON object with the same keys: items, verdicts.\n"
+                "- Do not add commentary.\n"
+                "- Ensure reasoningbank_item.content is valid RBMEM_CLAIMS_V1.\n"
+                "- Each claim MUST include inference: {\"summary\": \"...\"} with a non-empty summary (put the claim statement there).\n"
+                "- Do not include KB aliases like [C12].\n"
+                "- Do not include next-step experimental instructions in constraint.\n"
+                "- Do not use non-schema fields like 'statement'/'confidence' inside CLAIMS_JSON.\n"
+                f"Validation issues: {json.dumps(issues[:12], ensure_ascii=False)}\n"
+                "Previous output (for editing):\n"
+                f"{raw_content}\n"
+            )
             store.append_event(
                 rid,
                 "rb_llm_request",

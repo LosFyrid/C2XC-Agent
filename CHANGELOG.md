@@ -2,6 +2,10 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.2.6 (2026-01-19)
+
+- Fixed: RB learn format-fix flow no longer crashes with `UnboundLocalError: fix_prompt` when extractor outputs pass validation (or when issues are not detected).
+
 ## v0.2.5 (2026-01-19)
 
 - Fixed: ReasoningBank learn now enforces a retrievable claim anchor (`inference.summary` must be non-empty for every claim).
