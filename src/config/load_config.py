@@ -73,6 +73,7 @@ class RecapConfig:
     max_rounds: int
     max_depth: int
     max_steps: int
+    acceptance_max_repairs: int
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,9 @@ def load_app_config(path: Path | None = None) -> AppConfig:
             max_rounds=_as_int(recap.get("max_rounds"), key="recap.max_rounds"),
             max_depth=_as_int(recap.get("max_depth"), key="recap.max_depth"),
             max_steps=_as_int(recap.get("max_steps"), key="recap.max_steps"),
+            acceptance_max_repairs=_as_int(
+                recap.get("acceptance_max_repairs", 3), key="recap.acceptance_max_repairs"
+            ),
         ),
         kb=KBConfig(
             default_mode=_as_str(kb.get("default_mode"), key="kb.default_mode"),

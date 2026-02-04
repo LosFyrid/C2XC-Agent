@@ -1,5 +1,7 @@
 import ReactMarkdown from 'react-markdown'
+import remarkMath from 'remark-math'
 import remarkGfm from 'remark-gfm'
+import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 
@@ -19,25 +21,86 @@ const SANITIZE_SCHEMA = (() => {
   // Avoid loading remote resources via markdown/HTML.
   tagNames.delete('img')
 
+  // Keep class names for math blocks created by `remark-math` (rehype-katex looks for
+  // `language-math`, `math-inline`, `math-display`).
+  const attributes = { ...(base.attributes ?? {}) } as Record<string, unknown>
+  attributes.span = [...new Set([...(attributes.span as string[] | undefined) ?? [], 'className'])]
+  attributes.div = [...new Set([...(attributes.div as string[] | undefined) ?? [], 'className'])]
+  attributes.pre = [...new Set([...(attributes.pre as string[] | undefined) ?? [], 'className'])]
+  attributes.code = [
+    ...new Set([
+      ...((attributes.code as unknown[] | undefined) ?? []),
+      // Allow className (including `math-inline` etc); we style code blocks ourselves anyway.
+      'className',
+    ]),
+  ]
+
   return {
     ...base,
     tagNames: [...tagNames],
+    attributes,
   }
 })()
 
 function preprocessMarkdown(text: string): string {
   const s = text ?? ''
 
-  // Minimal math-ish conveniences seen in the KB/LLM outputs. We do not try to
-  // implement full LaTeX rendering here (keeps dependencies + attack surface small).
-  return (
-    s
-      .replaceAll('$\\rightarrow$', '→')
-      // Only replace standalone commands to avoid mangling e.g. "\tool" -> "→ol".
-      .replace(/\\rightarrow(?![A-Za-z])/g, '→')
-      .replaceAll('$\\to$', '→')
-      .replace(/\\to(?![A-Za-z])/g, '→')
-  )
+  // Some KB chunks contain double-escaped LaTeX commands inside `$...$` (e.g. `$\\mu$`).
+  // Normalize those to valid KaTeX input (`$\mu$`) while leaving non-math escapes intact.
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    const ch = s[i]
+
+    // Skip escaped characters (notably `\$` for literal `$`).
+    if (ch === '\\' && i + 1 < s.length) {
+      out += s.slice(i, i + 2)
+      i += 2
+      continue
+    }
+
+    if (ch === '$') {
+      const isDisplay = s[i + 1] === '$'
+      const delimLen = isDisplay ? 2 : 1
+      const delim = isDisplay ? '$$' : '$'
+      const start = i + delimLen
+
+      let j = start
+      while (j < s.length) {
+        const cj = s[j]
+        if (cj === '\\' && j + 1 < s.length) {
+          j += 2
+          continue
+        }
+        if (cj === '$') {
+          if (isDisplay) {
+            if (s[j + 1] === '$') break
+          } else {
+            break
+          }
+        }
+        j += 1
+      }
+
+      // Unmatched `$` / `$$`: treat as plain text.
+      if (j >= s.length) {
+        out += ch
+        i += 1
+        continue
+      }
+
+      const inner = s.slice(start, j)
+      const normalizedInner = inner.replace(/\\\\/g, '\\')
+      out += delim + normalizedInner + delim
+      i = j + delimLen
+      continue
+    }
+
+    out += ch
+    i += 1
+  }
+
+  return out
 }
 
 export function Markdown(props: { text: string }) {
@@ -46,8 +109,8 @@ export function Markdown(props: { text: string }) {
   return (
     <div className="grid gap-2 text-sm text-fg">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, SANITIZE_SCHEMA]]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, SANITIZE_SCHEMA], rehypeKatex]}
         components={{
           p: ({ children }) => <p className="whitespace-pre-wrap leading-relaxed">{children}</p>,
           ul: ({ children }) => <ul className="list-disc space-y-1 pl-5">{children}</ul>,

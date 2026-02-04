@@ -34,6 +34,8 @@ class _FakeLLM:
 
     def __init__(self) -> None:
         self._planned_mem_search = False
+        self._done_tio2 = False
+        self._done_mof = False
 
     def chat_messages(self, *, messages: list[dict[str, Any]], temperature: float, extra: dict[str, Any] | None = None) -> ChatCompletionResult:  # noqa: D401,E501
         extra = extra or {}
@@ -42,15 +44,45 @@ class _FakeLLM:
         rf = extra.get("response_format") or {}
         schema_name = ((rf.get("json_schema") or {}) if isinstance(rf, dict) else {}).get("name")
         if schema_name == "recap_response":
-            # First: force a mem_search primitive so generate_recipes is allowed (engine hard-check).
-            # Then: only generate_recipes.
+            # Determine which role we are currently acting as from the injected role instructions.
+            # (The engine uses a shared chat history but injects role instructions into the user prompt.)
+            prompt = str((messages[-1] or {}).get("content") or "")
+            is_tio2 = "Role: tio2_expert" in prompt
+            is_mof = "Role: mof_expert" in prompt
+
+            if is_tio2:
+                self._done_tio2 = True
+                report = {
+                    "schema": "tio2_mechanisms_report_v1",
+                    "mechanisms": [
+                        {"id": i, "impact": "supporting", "justification": "synthetic"} for i in range(1, 8)
+                    ],
+                    "synthesis": "synthetic",
+                }
+                content = json.dumps({"think": "", "subtasks": [], "result": report})
+                return ChatCompletionResult(content=content, raw={}, tool_calls=[])
+
+            if is_mof:
+                self._done_mof = True
+                report = {
+                    "schema": "mof_roles_report_v1",
+                    "roles": [
+                        {"id": i, "impact": "minor", "justification": "synthetic"} for i in range(1, 11)
+                    ],
+                    "synthesis": "synthetic",
+                }
+                content = json.dumps({"think": "", "subtasks": [], "result": report})
+                return ChatCompletionResult(content=content, raw={}, tool_calls=[])
+
+            # Orchestrator: strict gating now requires accepted expert deliverables before generate_recipes.
             subtasks: list[dict[str, Any]]
-            if not self._planned_mem_search:
+            if not self._done_tio2:
+                subtasks = [{"type": "task", "role": "tio2_expert", "task": "synthetic tio2 report"}]
+            elif not self._done_mof:
+                subtasks = [{"type": "task", "role": "mof_expert", "task": "synthetic mof report"}]
+            elif not self._planned_mem_search:
                 self._planned_mem_search = True
-                subtasks = [
-                    {"type": "mem_search", "query": "synthetic", "top_k": 5},
-                    {"type": "generate_recipes"},
-                ]
+                subtasks = [{"type": "mem_search", "query": "synthetic", "top_k": 5}]
             else:
                 subtasks = [{"type": "generate_recipes"}]
 

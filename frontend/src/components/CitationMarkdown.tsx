@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
+import remarkMath from 'remark-math'
 import remarkGfm from 'remark-gfm'
+import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import { Link } from 'react-router-dom'
@@ -15,29 +17,87 @@ const SANITIZE_SCHEMA = (() => {
   const base = defaultSchema as unknown as {
     tagNames?: string[]
     protocols?: Record<string, unknown>
+    attributes?: Record<string, unknown>
   }
   const tagNames = new Set([...(base.tagNames ?? [])])
   tagNames.add('sub')
   tagNames.add('sup')
   tagNames.add('br')
   tagNames.delete('img')
+  const attributes = { ...(base.attributes ?? {}) } as Record<string, unknown>
+  attributes.span = [...new Set([...(attributes.span as string[] | undefined) ?? [], 'className'])]
+  attributes.div = [...new Set([...(attributes.div as string[] | undefined) ?? [], 'className'])]
+  attributes.pre = [...new Set([...(attributes.pre as string[] | undefined) ?? [], 'className'])]
+  attributes.code = [
+    ...new Set([
+      ...((attributes.code as unknown[] | undefined) ?? []),
+      'className',
+    ]),
+  ]
   const protocols = { ...(base.protocols ?? {}) } as Record<string, unknown>
   const href = new Set([...(protocols.href as string[] | undefined) ?? []])
   href.add('c2xc')
   protocols.href = [...href]
 
-  return { ...base, tagNames: [...tagNames], protocols }
+  return { ...base, tagNames: [...tagNames], protocols, attributes }
 })()
 
 function preprocessMarkdown(text: string): string {
   const s = text ?? ''
-  return (
-    s
-      .replaceAll('$\\rightarrow$', '→')
-      .replace(/\\rightarrow(?![A-Za-z])/g, '→')
-      .replaceAll('$\\to$', '→')
-      .replace(/\\to(?![A-Za-z])/g, '→')
-  )
+
+  // Normalize double-escaped LaTeX commands inside `$...$` / `$$...$$` to valid KaTeX input.
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    const ch = s[i]
+
+    if (ch === '\\' && i + 1 < s.length) {
+      out += s.slice(i, i + 2)
+      i += 2
+      continue
+    }
+
+    if (ch === '$') {
+      const isDisplay = s[i + 1] === '$'
+      const delimLen = isDisplay ? 2 : 1
+      const delim = isDisplay ? '$$' : '$'
+      const start = i + delimLen
+
+      let j = start
+      while (j < s.length) {
+        const cj = s[j]
+        if (cj === '\\' && j + 1 < s.length) {
+          j += 2
+          continue
+        }
+        if (cj === '$') {
+          if (isDisplay) {
+            if (s[j + 1] === '$') break
+          } else {
+            break
+          }
+        }
+        j += 1
+      }
+
+      if (j >= s.length) {
+        out += ch
+        i += 1
+        continue
+      }
+
+      const inner = s.slice(start, j)
+      const normalizedInner = inner.replace(/\\\\/g, '\\')
+      out += delim + normalizedInner + delim
+      i = j + delimLen
+      continue
+    }
+
+    out += ch
+    i += 1
+  }
+
+  return out
 }
 
 function injectC2xcLinks(
@@ -88,8 +148,8 @@ export function CitationMarkdown(props: {
   return (
     <div className="grid gap-2 text-sm text-fg">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, SANITIZE_SCHEMA]]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, SANITIZE_SCHEMA], rehypeKatex]}
         components={{
           p: ({ children }) => <p className="whitespace-pre-wrap leading-relaxed">{children}</p>,
           ul: ({ children }) => <ul className="list-disc space-y-1 pl-5">{children}</ul>,

@@ -11,6 +11,8 @@ max_rounds = 64
 max_depth = 6
 # Safety bound for total loop iterations per run.
 max_steps = 100
+# Strict acceptance: max repair attempts when an expert deliverable fails schema/coverage validation.
+acceptance_max_repairs = 3
 
 [kb]
 # Default retrieval behavior for LightRAG query_data
@@ -118,17 +120,53 @@ Task:
    - grounded in the feedback signal (success/failure patterns).
 3) Do NOT invent literature citations. These are experience memories.
 4) Prefer 1–5 high-signal items over many low-value items.
-5) Strict output requirements for any reasoningbank_item:
+5) Role policy (IMPORTANT for reuse):
+   - Default to role="global" so all agents can retrieve/use the lesson.
+   - Only use a non-global role (orchestrator|mof_expert|tio2_expert) if the lesson is truly role-specific AND
+     would be misleading/noisy for other roles.
+   - If you choose a non-global role, you MUST add `extra.role_specific_reason` explaining why it must be role-limited.
+6) Strict output requirements for any reasoningbank_item:
    - memory.content MUST be RBMEM_CLAIMS_V1 (key=value block) with CLAIMS_JSON array.
    - Max 10 claims per item.
    - claim.status must be one of: fact|hypothesis|conclusion
-   - Do NOT include run-local KB aliases like [C12] or [C5, C16] anywhere in RB memory content.
+   - Do NOT include run-local evidence aliases like [C12], [C5, C16], or [P3] anywhere in RB memory content.
    - Do NOT include next-step experimental instructions in constraint.
    - Constraints default to negative constraints (avoid). Positive constraints (must/prefer) are allowed ONLY as explicit exceptions
      with allow_positive=true and exception_reason.
    - You may omit claim.facts (it will be injected by the system); do NOT fabricate facts.
+   - Retrieval anchor requirement (CRITICAL): each claim MUST include a non-empty `inference.summary`
+     that states the claim in plain language. Do NOT use keys like "statement" or put the claim only in free-form fields.
 
-6) Additionally, update claim verdicts for candidate memories:
+RBMEM_CLAIMS_V1 claim schema (STRICT):
+- The RBMEM_CLAIMS_V1 block MUST look like:
+  RBMEM_CLAIMS_V1
+  TOPIC=<optional>
+  SCOPE=<optional; informational only>
+  CLAIMS_JSON=[{...}, {...}]
+
+- Each claim object inside CLAIMS_JSON MUST use ONLY these keys (extra keys may be discarded by the parser):
+  {
+    "claim_id": "c1",
+    "status": "fact|hypothesis|conclusion",
+    "facts": { ... }                       # optional (will be overwritten by system)
+    "inference": { "summary": "..." },     # REQUIRED (non-empty)
+    "constraint": {                        # REQUIRED (object; defaults are OK)
+      "avoid": ["..."],                    # optional list of strings
+      "allow_positive": false,             # required boolean
+      "summary": "..."                     # optional short summary
+      # Optional positive constraints (ONLY when allow_positive=true + exception_reason):
+      # "must": ["..."], "prefer": ["..."], "exception_reason": "..."
+    },
+    "conditions": ["..."],                 # optional list of strings
+    "limitations": ["..."],                # optional list of strings
+    "support": { "count": 0, "run_ids": [] },
+    "contra":  { "count": 0, "run_ids": [] }
+  }
+
+- DO NOT use fields like: "statement", "confidence", or a string-valued "constraint".
+  Put confidence/tags/notes under item.extra (not inside CLAIMS_JSON).
+
+7) Additionally, update claim verdicts for candidate memories:
    - For each candidate memory claim you can judge, output a verdict: support|contradict|irrelevant.
    - Use only mem_id + claim_id from the candidate memories. Do not guess unknown ids.
 
@@ -142,7 +180,8 @@ Return a single JSON object:
       "extra": {
         "confidence": 0.0,
         "tags": ["string"],
-        "notes": "string"
+        "notes": "string",
+        "role_specific_reason": "string (required only when role != global)"
       }
     }
   ],
@@ -167,7 +206,7 @@ Task:
 - Keep it concise, actionable, and consistent with the fixed system constraints.
 - Output content MUST remain a valid RBMEM_CLAIMS_V1 block (strictly parseable).
 - Ensure the merged item has <= 10 claims (dedupe similar claims if needed).
-- Do NOT include run-local KB aliases like [C12] anywhere in the merged content.
+- Do NOT include run-local evidence aliases like [C12] or [P3] anywhere in the merged content.
 - If they are NOT near-duplicates, return content that keeps them separate by stating "NOT_DUPLICATE" as content.
 
 Return a single JSON object:
@@ -238,6 +277,23 @@ Convergence criterion (strict):
   (1) each of the 10 items has a stable conclusion (or explicit N/A with reason), AND
   (2) your synthesis across all items remains stable after considering interactions.
   If synthesis reveals conflicts/unknowns, backtrack to the relevant item(s) and revise until stable.
+
+Deliverable contract (STRICT; machine-validated):
+- When you finish (subtasks=[]), your `result` MUST be a single JSON object (no extra text) with:
+  - schema="mof_roles_report_v1"
+  - roles: array of 10 items, ids 1..10 exactly once
+  - each role item MUST include: id, impact, justification
+  - impact enum: critical|supporting|minor|negligible|na
+    - negligible/na are allowed ONLY if justified (why negligible / why not applicable in this run)
+  - evidence is optional but recommended (list of citations like "C12", "P3", "mem:<uuid>")
+Example skeleton:
+{
+  "schema": "mof_roles_report_v1",
+  "roles": [
+    { "id": 1, "impact": "supporting", "justification": "...", "evidence": ["C1"] }
+  ],
+  "synthesis": "..."
+}
 """
 
 tio2_expert = """
@@ -262,6 +318,23 @@ Convergence criterion (strict):
   (1) each of the 7 items has a stable conclusion (or explicit N/A with reason), AND
   (2) your synthesis across all items remains stable after considering interactions.
   If synthesis reveals conflicts/unknowns, backtrack to the relevant item(s) and revise until stable.
+
+Deliverable contract (STRICT; machine-validated):
+- When you finish (subtasks=[]), your `result` MUST be a single JSON object (no extra text) with:
+  - schema="tio2_mechanisms_report_v1"
+  - mechanisms: array of 7 items, ids 1..7 exactly once
+  - each mechanism item MUST include: id, impact, justification
+  - impact enum: critical|supporting|minor|negligible|na
+    - negligible/na are allowed ONLY if justified (why negligible / why not applicable in this run)
+  - evidence is optional but recommended (list of citations like "C12", "P3", "mem:<uuid>")
+Example skeleton:
+{
+  "schema": "tio2_mechanisms_report_v1",
+  "mechanisms": [
+    { "id": 1, "impact": "critical", "justification": "...", "evidence": ["C5"] }
+  ],
+  "synthesis": "..."
+}
 """
 
 [prompts]
@@ -280,31 +353,50 @@ Hard recipe requirements (for every recipe in the final output):
 - small_molecule_modifier: MUST contain a carboxylic acid group (-COOH)
 
 Citation rules:
-- Two kinds of citations are allowed:
+- Three kinds of citations are allowed:
   1) Knowledge Base evidence: short aliases like [C1], [C2] provided by kb_search observations.
-  2) ReasoningBank experience memories: cite as mem:<uuid> (e.g. mem:123e4567-e89b-12d3-a456-426614174000).
+  2) PubChem evidence: short aliases like [P1], [P2] provided by pubchem actions / pubchem_query tool calls.
+  3) ReasoningBank experience memories: cite as mem:<uuid> (e.g. mem:123e4567-e89b-12d3-a456-426614174000).
 
 - KB alias rules:
   - These aliases are valid across the whole run (across multiple kb_search calls). You may cite any alias that has appeared.
   - Do NOT invent KB aliases. If you need literature evidence, run kb_search first.
 
+- PubChem alias rules:
+  - Do NOT invent PubChem aliases. If you need numeric facts / experimental properties, run pubchem first.
+  - PubChem evidence is "dirty" by design: multiple sources/conditions may appear. Use your judgment and state conditions.
+
 - Memory citation rules:
   - Do NOT invent mem:<id>. If you need experience evidence, run mem_search first.
   - You may only cite mem:<id> values that exist in the current run memory registry (returned by mem_search).
 
-- When you make a claim based on evidence (KB or memory), cite **inline** (paper-style): place [C2] or mem:<id>
+- When you make a claim based on evidence (KB, PubChem, or memory), cite **inline** (paper-style): place [C2], [P3], or mem:<id>
   right next to the specific sentence/claim it supports. Do not only list citations at the end.
 
 Evidence workflow (recommended):
 - Use kb_search to discover relevant chunks (observation shows full chunk text).
 - Use kb_list to recall which aliases exist in the run evidence registry.
 - Use kb_get to re-open any chunk by alias when you need to verify details.
+- Use pubchem to fetch numeric descriptors / experimental-property evidence from PubChem.
+  Each successful call stores a citeable alias [P#] in the run evidence registry.
+  - op="property_table": use for standard compound descriptors (e.g., MolecularWeight, ExactMass, XLogP, TPSA,
+    HBondDonorCount/HBondAcceptorCount, RotatableBondCount, Charge, Complexity, InChIKey, SMILES).
+  - op="pug_view_section": use for experimental properties (often NOT available via property_table), e.g.:
+    - pKa: heading="Dissociation Constants"  (IMPORTANT: pKa is NOT a valid property_table property)
+    - solubility: heading="Solubility"
+    - melting point: heading="Melting Point"
+  - If PubChem cannot resolve a CID (common for materials like doped TiO2), fall back to kb_search and state the limitation.
 - Use mem_search to discover relevant memory items (observation shows mem:<id> and a snippet).
 - Use mem_list to recall which mem:<id> values exist in the run memory registry.
 - Use mem_get to re-open the full memory content by mem_id when you need to verify details.
 - Before calling generate_recipes, it helps to "focus" the evidence you rely on (opened via kb_get or cited inline),
   because generate_recipes is a tool-driven process and there is still a limit on how many full chunks can be opened
   during final generation (context budget). Prioritize the most important evidence.
+
+Numeric claim policy (important):
+- Any time you are about to write a numeric value (or numeric range), you MUST first attempt PubChem to retrieve evidence.
+  - If PubChem returns data: cite the returned [P#] next to the numeric claim.
+  - If PubChem has no data / errors: you MAY still estimate numbers, but understand they will be unsourced.
 
 Domain priors:
 - The system description prior is authoritative and should not be overridden.
@@ -328,6 +420,7 @@ Structured subtasks (NO string DSL):
   - "mem_search"
   - "mem_get"
   - "mem_list"
+  - "pubchem"
   - "generate_recipes"
 
 - type="task":
@@ -369,6 +462,16 @@ Structured subtasks (NO string DSL):
 - type="mem_list":
   { "type": "mem_list", "limit": 30 }  # limit optional
 
+- type="pubchem":
+  {
+    "type": "pubchem",
+    "op": "resolve|property_table|pug_view_toc|pug_view_section",
+    "query": "string",                 # optional if cid is provided
+    "cid": 243,                        # optional if query is provided
+    "heading": "Solubility",           # required for op="pug_view_section" (e.g. "Dissociation Constants" for pKa)
+    "properties": ["MolecularWeight"]  # optional for op="property_table"
+  }
+
 - type="generate_recipes":
   { "type": "generate_recipes" }
 
@@ -378,7 +481,7 @@ generate_recipes restriction:
 Completion (important for UP-stage integration):
 - When the current task is fully achieved, return subtasks as an empty list [] AND include a non-empty "result"
   (string or JSON) summarizing your deliverable for the parent task.
-- In `result`, use **inline citations** like [C3] or mem:<id> exactly where a claim is supported by evidence.
+- In `result`, use **inline citations** like [C3], [P2], or mem:<id> exactly where a claim is supported by evidence.
 
 Stopping:
 - If the current task is fully achieved, return an empty subtasks list [].
@@ -458,12 +561,18 @@ User request:
 Run evidence registry index (aliases are stable across the whole run):
 {{kb_evidence_index}}
 
+Run PubChem evidence registry index (aliases are stable across the whole run):
+{{pubchem_evidence_index}}
+
 Run memory registry index (mem:<id> values are stable across the whole run):
 {{mem_evidence_index}}
 
 Tooling (recommended):
 - Use kb_get <alias> to open the full original chunk text for any alias you want to rely on.
 - Use kb_list [limit=...] if you need to recall what aliases exist.
+- Use pubchem_query to retrieve numeric/experimental evidence from PubChem (returns a citeable alias like [P3]).
+- Use pubchem_get <alias> to open a stored PubChem evidence item by alias.
+- Use pubchem_list [limit=...] if you need to recall what PubChem aliases exist.
 - Use mem_get <mem_id> to open the full memory content for any mem:<id> you want to rely on.
 - Use mem_list [limit=...] if you need to recall what mem:<id> values exist.
 - Use mem_search <query> to retrieve relevant memories into the run memory registry.
@@ -475,13 +584,14 @@ Each recipe must include:
 - M2
 - atomic_ratio
 - small_molecule_modifier (must contain -COOH)
-- rationale (must include at least one inline citation: either a KB alias like [C1] or a memory id like mem:<uuid>)
+- rationale (must include at least one inline citation: a KB alias like [C1], a PubChem alias like [P3], or a memory id like mem:<uuid>)
 
 Important:
 - You MUST cite using:
   - KB aliases that exist in the run evidence registry (shown above / via kb_list / via kb_get), OR
+  - PubChem aliases that exist in the run evidence registry (shown above / via pubchem_list / via pubchem_get), OR
   - mem:<id> values that exist in the run memory registry (shown above / via mem_list / via mem_get).
-- Output MUST contain at least one citation somewhere (KB or memory), and citations must be inline (paper-style).
+- Output MUST contain at least one citation somewhere (KB or PubChem or memory), and citations must be inline (paper-style).
 - Place citations inline next to the relevant claim(s) (paper-style), not as a detached bibliography.
 
 Return a single JSON object:

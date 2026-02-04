@@ -89,6 +89,7 @@ def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
     status: list[str] | None = Query(default=None),
+    include_hidden: bool = Query(default=False, description="Include soft-hidden runs."),
 ) -> dict[str, Any]:
     store = SQLiteStore()
     try:
@@ -104,6 +105,7 @@ def list_runs(
             limit=int(limit),
             cursor=(cursor_obj.created_at, cursor_obj.item_id) if cursor_obj is not None else None,
             statuses=status or None,
+            include_hidden=bool(include_hidden),
         )
         next_cursor = page.get("next_cursor")
         if next_cursor is not None:
@@ -131,6 +133,7 @@ def get_run(run_id: str) -> dict[str, Any]:
                 "ended_at": float(row["ended_at"]) if row["ended_at"] is not None else None,
                 "status": row["status"],
                 "error": row["error"],
+                "hidden_at": float(row["hidden_at"]) if row["hidden_at"] is not None else None,
             }
         }
     finally:

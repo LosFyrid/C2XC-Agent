@@ -2,7 +2,7 @@ import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-q
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ApiError } from '../api/client'
-import { cancelBatch, createBatch, listBatches, listRuns } from '../api/c2xc'
+import { cancelBatch, createBatch, hideBatch, listBatches, listRuns } from '../api/c2xc'
 import type { CreateBatchRequest, RunListItem } from '../api/types'
 import { useConfirmDialog } from '../components/ConfirmDialog'
 import { DependencyUnavailablePanel } from '../components/DependencyUnavailablePanel'
@@ -175,8 +175,24 @@ export function RunsPage() {
     },
   })
 
+  const [hidingBatchId, setHidingBatchId] = useState<string | null>(null)
+  const hideBatchMutation = useMutation({
+    mutationFn: (batchId: string) => hideBatch(batchId),
+    onMutate: (batchId) => {
+      setHidingBatchId(batchId)
+    },
+    onSettled: () => {
+      setHidingBatchId(null)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['batches'] })
+      queryClient.invalidateQueries({ queryKey: ['runs'] })
+    },
+  })
+
   const createError = createMutation.error as ApiError | undefined
   const cancelError = cancelBatchMutation.error as ApiError | undefined
+  const hideError = hideBatchMutation.error as ApiError | undefined
 
   const canSubmit = useMemo(() => {
     if (createMutation.isPending) return false
@@ -334,6 +350,7 @@ export function RunsPage() {
             const expanded = !!expandedBatchIds[b.batch_id]
             const canCancel = b.status === 'queued' || b.status === 'running'
             const cancelingThis = cancelingBatchId === b.batch_id && cancelBatchMutation.isPending
+            const hidingThis = hidingBatchId === b.batch_id && hideBatchMutation.isPending
             return (
               <div key={b.batch_id} className="rounded-lg border border-border bg-surface p-4">
                 <div className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
@@ -360,6 +377,38 @@ export function RunsPage() {
                       title={!canCancel ? t('common.noopTerminal') : undefined}
                     >
                       {cancelingThis ? t('common.loading') : t('batch.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (hideBatchMutation.isPending) return
+                        const details = JSON.stringify(
+                          {
+                            batch_id: b.batch_id,
+                            status: b.status,
+                            created_at: b.created_at,
+                            user_request: b.user_request,
+                            n_runs: b.n_runs,
+                            recipes_per_run: b.recipes_per_run,
+                          },
+                          null,
+                          2,
+                        )
+                        const ok = await confirm({
+                          title: t('confirm.removeBatch.title'),
+                          message: t('confirm.removeBatch.message'),
+                          details: <pre className="whitespace-pre-wrap font-mono">{details}</pre>,
+                          confirmText: t('confirm.confirm'),
+                          cancelText: t('confirm.cancel'),
+                          intent: 'danger',
+                        })
+                        if (!ok) return
+                        hideBatchMutation.mutate(b.batch_id)
+                      }}
+                      disabled={hideBatchMutation.isPending || cancelingThis}
+                      className="h-9 rounded-md border border-border bg-bg px-3 text-sm text-fg hover:border-danger disabled:opacity-50"
+                    >
+                      {hidingThis ? t('common.loading') : t('batch.remove')}
                     </button>
                     <button
                       type="button"
@@ -393,6 +442,12 @@ export function RunsPage() {
         {cancelError ? (
           <div className="text-sm text-danger">
             {cancelError.code}: {cancelError.message}
+          </div>
+        ) : null}
+
+        {hideError ? (
+          <div className="text-sm text-danger">
+            {hideError.code}: {hideError.message}
           </div>
         ) : null}
       </section>

@@ -2,6 +2,35 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.2.6 (2026-01-19)
+
+- Fixed: RB learn format-fix flow no longer crashes with `UnboundLocalError: fix_prompt` when extractor outputs pass validation (or when issues are not detected).
+
+## v0.2.5 (2026-01-19)
+
+- Fixed: ReasoningBank learn now enforces a retrievable claim anchor (`inference.summary` must be non-empty for every claim).
+- Improved: RB extractor prompt now includes an explicit RBMEM_CLAIMS_V1 claim schema (prevents unsupported fields like `statement`/`confidence` being dropped by the parser).
+- Changed: RB learn role policy defaults learned items to `global` unless the extractor provides an explicit `extra.role_specific_reason`.
+  - Adds `rb_role_policy_override` trace event when a non-global role is requested without justification.
+- Improved: PubChem usage guidance is now embedded in prompts/tool descriptions (e.g., pKa via `pug_view_section` + heading `Dissociation Constants`; materials like doped TiO2 often cannot resolve CID).
+
+## v0.2.4 (2026-01-19)
+
+- Improved: Memory UI for new RB item format (`RBMEM_CLAIMS_V1`)
+  - Adds a structured "claims" view (list + details) and keeps a Raw fallback.
+  - Memory list prefers RB-generated `extra.notes` for previews (avoids huge JSON snippets).
+
+## v0.2.3 (2026-01-18)
+
+- New: Strict expert deliverable acceptance (schema + coverage) with automatic repair loops (configurable via `recap.acceptance_max_repairs`)
+  - `tio2_expert` must cover all 7 mechanisms (`tio2_mechanisms_report_v1`, allowing `negligible|na` with justification).
+  - `mof_expert` must cover all 10 roles (`mof_roles_report_v1`, allowing `negligible|na` with justification).
+  - Root `generate_recipes` is blocked until both experts pass acceptance (prevents "claimed verification" without evidence).
+- New: Agent-facing PubChem evidence registry with citeable aliases `[P#]`
+  - Primitive action: `type="pubchem"` (supports `resolve|property_table|pug_view_toc|pug_view_section`)
+  - generate_recipes tools: `pubchem_query`, `pubchem_list`, `pubchem_get`
+  - Evidence API now aggregates both KB evidence (`kb_query`, `[C#]`) and PubChem evidence (`pubchem_query`, `[P#]`).
+
 ## v0.2.2 (2026-01-17)
 
 - Fixed: `/api/v1/runs/{run_id}/modifier_checks` no longer crashes due to `sqlite3.Row` lacking `.get()` (PubChem panel 500).
@@ -14,7 +43,7 @@ This project currently has no tagged releases. Version labels below follow commi
 
 - Improved: WebUI long-text readability and traceability
   - Trace/JSON viewer: long string fields are expandable (with a rendered view + copy).
-  - Evidence viewer: evidence chunks render Markdown + safe HTML (e.g. `<sub>/<sup>`) with a Raw fallback view.
+  - Evidence viewer: evidence chunks render Markdown + safe HTML (e.g. `<sub>/<sup>`) + LaTeX math (`$...$`/`$$...$$`), with a Raw fallback view.
   - JSON Tree: object/array nodes support "Show more"/"Show all" to reveal previously hidden keys/items.
   - Output: recipe rationales and `overall_notes` render Markdown while preserving clickable citation aliases.
 
