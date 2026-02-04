@@ -63,6 +63,7 @@ const EN: Dictionary = {
   'trace.preset.rb': 'RB',
 
   'batch.cancel': 'Cancel batch',
+  'batch.remove': 'Remove batch',
 
   'common.loading': 'Loading…',
   'common.error': 'Error',
@@ -140,6 +141,9 @@ const EN: Dictionary = {
   'confirm.agentRun.title': 'Start agent run?',
   'confirm.agentRun.message':
     'This action will start a run. If dry_run=false, the backend may call the configured LLM/KB endpoints and may incur API costs.',
+  'confirm.removeBatch.title': 'Remove batch from UI?',
+  'confirm.removeBatch.message':
+    'This will hide the batch and all its runs from the Runs page. Data is kept in SQLite (not deleted).',
   'confirm.confirm': 'Confirm',
   'confirm.cancel': 'Cancel',
 
@@ -236,6 +240,7 @@ const ZH: Dictionary = {
   'trace.preset.rb': 'RB',
 
   'batch.cancel': '取消 batch',
+  'batch.remove': '移除 batch',
 
   'common.loading': '加载中…',
   'common.error': '错误',
@@ -312,6 +317,8 @@ const ZH: Dictionary = {
   'confirm.agentRun.title': '确认启动 Agent/LLM 运行？',
   'confirm.agentRun.message':
     '该操作将开始一次 run。若 dry_run=false，后端可能会调用配置的 LLM/KB 接口，并可能产生 API 费用。',
+  'confirm.removeBatch.title': '从 UI 中移除该批次？',
+  'confirm.removeBatch.message': '该操作会在 Runs 页面隐藏此批次及其 runs（不会真正删除 SQLite 中的数据）。',
   'confirm.confirm': '确认',
   'confirm.cancel': '取消',
 

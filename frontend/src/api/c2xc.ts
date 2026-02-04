@@ -103,6 +103,23 @@ export function cancelBatch(
   })
 }
 
+export function hideBatch(
+  batchId: string,
+  reason?: string,
+): Promise<{ batch_id: string; hidden_at?: number | null; status: string }> {
+  return apiFetch(`/batches/${encodeURIComponent(batchId)}/hide`, {
+    method: 'POST',
+    body: JSON.stringify({ reason: reason ?? 'user_hide' }),
+  })
+}
+
+export function unhideBatch(batchId: string): Promise<{ batch_id: string; status: string }> {
+  return apiFetch(`/batches/${encodeURIComponent(batchId)}/unhide`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
 export function getRunOutput(runId: string): Promise<RunOutputResponse> {
   return apiFetch(`/runs/${runId}/output`)
 }

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 _ALIAS_RE = re.compile(r"^(?P<prefix>[A-Z]+)(?P<num>\d+)$")
@@ -286,6 +286,10 @@ class SQLiteStore:
                     self._migrate_4_to_5(cur)
                     current = 5
                     self._set_schema_version(current)
+                elif current == 5:
+                    self._migrate_5_to_6(cur)
+                    current = 6
+                    self._set_schema_version(current)
                 else:
                     raise RuntimeError(f"Missing migration step for schema_version={current} -> {current+1}")
             self._conn.commit()
@@ -479,6 +483,29 @@ class SQLiteStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rb_mem_index_role_created ON rb_mem_index(role, created_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rb_mem_index_type_created ON rb_mem_index(type, created_at);")
 
+    def _migrate_5_to_6(self, cur: sqlite3.Cursor) -> None:
+        """Milestone 4: soft-hide batches/runs (UI delete without data loss).
+
+        We intentionally model "delete from UI" as a visibility flag, not a status.
+        Status keeps representing lifecycle (queued/running/completed/failed/canceled).
+        """
+        # SQLite does not support ADD COLUMN IF NOT EXISTS across all versions; use best-effort try/except.
+        try:
+            cur.execute("ALTER TABLE batches ADD COLUMN hidden_at REAL;")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        try:
+            cur.execute("ALTER TABLE runs ADD COLUMN hidden_at REAL;")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        # Helpful indexes for filtering newest-first lists.
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_batches_hidden_created ON batches(hidden_at, created_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_hidden_created ON runs(hidden_at, created_at);")
+
     # --- Idempotency (API support)
     def get_idempotency(self, key: str) -> sqlite3.Row | None:
         return self._conn.execute(
@@ -507,7 +534,7 @@ class SQLiteStore:
             """
             SELECT
               batch_id, created_at, started_at, ended_at, user_request, n_runs, recipes_per_run,
-              status, config_json, error
+              status, config_json, error, hidden_at
             FROM batches
             WHERE batch_id = ?
             LIMIT 1;
@@ -519,7 +546,7 @@ class SQLiteStore:
         return self._conn.execute(
             """
             SELECT
-              run_id, batch_id, run_index, created_at, started_at, ended_at, status, error
+              run_id, batch_id, run_index, created_at, started_at, ended_at, status, error, hidden_at
             FROM runs
             WHERE run_id = ?
             LIMIT 1;
@@ -533,9 +560,13 @@ class SQLiteStore:
         limit: int,
         cursor: tuple[float, str] | None,
         statuses: list[str] | None,
+        include_hidden: bool = False,
     ) -> dict[str, Any]:
         where = ["1=1"]
         params: list[Any] = []
+
+        if not include_hidden:
+            where.append("hidden_at IS NULL")
 
         if statuses:
             where.append("status IN (%s)" % ",".join(["?"] * len(statuses)))
@@ -554,7 +585,7 @@ class SQLiteStore:
             f"""
             SELECT
               batch_id, created_at, started_at, ended_at,
-              user_request, n_runs, recipes_per_run, status, error
+              user_request, n_runs, recipes_per_run, status, error, hidden_at
             FROM batches
             WHERE {where_sql}
             ORDER BY created_at DESC, batch_id DESC
@@ -578,6 +609,7 @@ class SQLiteStore:
                 "recipes_per_run": int(r["recipes_per_run"]),
                 "status": r["status"],
                 "error": r["error"],
+                "hidden_at": float(r["hidden_at"]) if r["hidden_at"] is not None else None,
             }
             for r in rows
         ]
@@ -596,9 +628,13 @@ class SQLiteStore:
         limit: int,
         cursor: tuple[float, str] | None,
         statuses: list[str] | None,
+        include_hidden: bool = False,
     ) -> dict[str, Any]:
         where = ["1=1"]
         params: list[Any] = []
+
+        if not include_hidden:
+            where.append("hidden_at IS NULL")
 
         if batch_id:
             where.append("batch_id = ?")
@@ -619,7 +655,7 @@ class SQLiteStore:
         rows = self._conn.execute(
             f"""
             SELECT
-              run_id, batch_id, run_index, created_at, started_at, ended_at, status, error
+              run_id, batch_id, run_index, created_at, started_at, ended_at, status, error, hidden_at
             FROM runs
             WHERE {where_sql}
             ORDER BY created_at DESC, run_id DESC
@@ -642,6 +678,7 @@ class SQLiteStore:
                 "ended_at": float(r["ended_at"]) if r["ended_at"] is not None else None,
                 "status": r["status"],
                 "error": r["error"],
+                "hidden_at": float(r["hidden_at"]) if r["hidden_at"] is not None else None,
             }
             for r in rows
         ]
@@ -739,6 +776,38 @@ class SQLiteStore:
             """,
             (status, started_at, ended_at, error, batch_id),
         )
+        self._conn.commit()
+
+    def hide_batch(self, *, batch_id: str) -> float:
+        """Soft-hide a batch (and all its runs) from list endpoints.
+
+        Returns the timestamp used for `hidden_at`.
+        """
+        ts = _utc_ts()
+        self._conn.execute(
+            """
+            UPDATE batches
+            SET hidden_at = COALESCE(hidden_at, ?)
+            WHERE batch_id = ?;
+            """,
+            (ts, batch_id),
+        )
+        # Keep runs consistent with the batch visibility so /runs stays "unified".
+        self._conn.execute(
+            """
+            UPDATE runs
+            SET hidden_at = COALESCE(hidden_at, ?)
+            WHERE batch_id = ?;
+            """,
+            (ts, batch_id),
+        )
+        self._conn.commit()
+        return ts
+
+    def unhide_batch(self, *, batch_id: str) -> None:
+        """Undo `hide_batch` (best-effort restore)."""
+        self._conn.execute("UPDATE batches SET hidden_at = NULL WHERE batch_id = ?;", (batch_id,))
+        self._conn.execute("UPDATE runs SET hidden_at = NULL WHERE batch_id = ?;", (batch_id,))
         self._conn.commit()
 
     def create_run(self, *, batch_id: str, run_index: int, commit: bool = True) -> RunRecord:

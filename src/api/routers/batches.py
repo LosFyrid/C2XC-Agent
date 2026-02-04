@@ -35,6 +35,7 @@ def list_batches(
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
     status: list[str] | None = Query(default=None),
+    include_hidden: bool = Query(default=False, description="Include soft-hidden batches."),
 ) -> dict[str, Any]:
     store = SQLiteStore()
     try:
@@ -49,6 +50,7 @@ def list_batches(
             limit=int(limit),
             cursor=(cursor_obj.created_at, cursor_obj.item_id) if cursor_obj is not None else None,
             statuses=status or None,
+            include_hidden=bool(include_hidden),
         )
         next_cursor = page.get("next_cursor")
         if next_cursor is not None:
@@ -79,6 +81,7 @@ def get_batch(batch_id: str) -> dict[str, Any]:
                 "recipes_per_run": int(row["recipes_per_run"]),
                 "config_snapshot": config_snapshot,
                 "error": row["error"],
+                "hidden_at": float(row["hidden_at"]) if row["hidden_at"] is not None else None,
             }
         }
     finally:
@@ -97,6 +100,44 @@ def cancel_batch(batch_id: str, body: dict[str, Any] | None = None) -> dict[str,
             reason = str(body.get("reason") or "").strip()
         cancel_id = store.request_cancel(target_type="batch", target_id=batch_id, reason=reason or None)
         return {"cancel_id": cancel_id, "status": "requested"}
+    finally:
+        store.close()
+
+
+@router.post("/batches/{batch_id}/hide")
+def hide_batch(batch_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Soft-hide a batch (and its runs) from list endpoints.
+
+    This does NOT delete data and does NOT cancel running work.
+    """
+    store = SQLiteStore()
+    try:
+        row = store.get_batch(batch_id=batch_id)
+        if row is None:
+            raise APIError(status_code=404, code="not_found", message="Batch not found.")
+
+        _reason = ""
+        if body:
+            _reason = str(body.get("reason") or "").strip()
+        # Reason is currently ignored (could be logged in a future audit table).
+        _ = _reason
+
+        ts = store.hide_batch(batch_id=batch_id)
+        return {"batch_id": batch_id, "hidden_at": ts, "status": "hidden"}
+    finally:
+        store.close()
+
+
+@router.post("/batches/{batch_id}/unhide")
+def unhide_batch(batch_id: str) -> dict[str, Any]:
+    """Undo `hide_batch` (best-effort restore)."""
+    store = SQLiteStore()
+    try:
+        row = store.get_batch(batch_id=batch_id)
+        if row is None:
+            raise APIError(status_code=404, code="not_found", message="Batch not found.")
+        store.unhide_batch(batch_id=batch_id)
+        return {"batch_id": batch_id, "status": "visible"}
     finally:
         store.close()
 
