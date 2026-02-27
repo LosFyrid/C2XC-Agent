@@ -1725,6 +1725,8 @@ def learn_reasoningbank_for_run(
                     "turn": int(turn),
                     "model": getattr(llm, "model", None),
                     "base_url": getattr(llm, "base_url", None),
+                    "reasoning_effort": getattr(llm, "reasoning_effort", None),
+                    "verbosity": getattr(llm, "verbosity", None),
                     "temperature": 0.2,
                     "response_schema": "rb_extract_items",
                     "snapshot": {
@@ -1873,6 +1875,8 @@ def learn_reasoningbank_for_run(
                     "purpose": "extract_format_fix",
                     "model": getattr(llm, "model", None),
                     "base_url": getattr(llm, "base_url", None),
+                    "reasoning_effort": getattr(llm, "reasoning_effort", None),
+                    "verbosity": getattr(llm, "verbosity", None),
                     "temperature": 0.0,
                 },
             )
@@ -2087,6 +2091,8 @@ def learn_reasoningbank_for_run(
                         "mem_id": chosen_existing.mem_id,
                         "model": getattr(llm, "model", None),
                         "base_url": getattr(llm, "base_url", None),
+                        "reasoning_effort": getattr(llm, "reasoning_effort", None),
+                        "verbosity": getattr(llm, "verbosity", None),
                         "temperature": 0.0,
                         "response_schema": "rb_merge_result",
                         "system": system,

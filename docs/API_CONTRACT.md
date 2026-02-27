@@ -130,6 +130,8 @@ Request（v1）：
     "kb_principles_dir": "",
     "kb_modulation_dir": "",
     "llm_model": "",
+    "llm_reasoning_effort": "high",
+    "llm_verbosity": "low",
     "openai_api_base": ""
   },
   "schema_version": 1,
@@ -138,6 +140,8 @@ Request（v1）：
 ```
 
 - `overrides`：仅用于调试/开发期临时覆盖；服务端应记录到 `config_snapshot`，但不建议长期暴露太多内部参数。
+  - 说明：当 `llm_reasoning_effort != "none"` 时，OpenAI 会拒绝同时发送 `temperature/top_p/logprobs`；因此 `temperature`
+    在该模式下等价于“仅用于记录/兼容”，不再影响实际采样。
 
 Response：
 

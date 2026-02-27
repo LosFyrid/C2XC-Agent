@@ -37,6 +37,16 @@ class OpenAICompatibleChatClient:
             return False
         return default
 
+    @staticmethod
+    def _env_str(name: str, default: str | None = None) -> str | None:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        s = raw.strip()
+        if s == "":
+            return default
+        return s
+
     def __init__(
         self,
         *,
@@ -54,6 +64,29 @@ class OpenAICompatibleChatClient:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.model = model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.timeout_s = timeout_s
+
+        # OpenAI reasoning knobs (GPT-5.* and other reasoning-capable models).
+        # IMPORTANT: when reasoning_effort != "none", OpenAI rejects temperature/top_p/logprobs. Keep
+        # temperature in our function signatures for backwards compatibility + trace observability,
+        # but avoid sending it in requests whenever reasoning_effort is enabled.
+        self.reasoning_effort = (
+            (self._env_str("C2XC_LLM_REASONING_EFFORT", "none") or "none").strip().lower()
+        )
+        # "minimal" exists in the OpenAI SDK type; treat it as valid even if we usually use high/xhigh.
+        allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        if self.reasoning_effort not in allowed_efforts:
+            raise LLMConfigError(
+                "Invalid C2XC_LLM_REASONING_EFFORT: "
+                f"{self.reasoning_effort!r} (expected one of {sorted(allowed_efforts)})"
+            )
+        _verbosity = self._env_str("C2XC_LLM_VERBOSITY")
+        self.verbosity = _verbosity.strip().lower() if _verbosity else None
+        allowed_verbosity = {"low", "medium", "high"}
+        if self.verbosity is not None and self.verbosity not in allowed_verbosity:
+            raise LLMConfigError(
+                f"Invalid C2XC_LLM_VERBOSITY: {self.verbosity!r} (expected one of {sorted(allowed_verbosity)})"
+            )
+
         # Qwen-plus hybrid-thinking (DashScope compatible mode):
         # - Only send `enable_thinking` when explicitly enabled, because other providers/models may reject it.
         self.enable_thinking = self._env_bool("C2XC_LLM_ENABLE_THINKING", False)
@@ -90,13 +123,32 @@ class OpenAICompatibleChatClient:
         temperature: float,
         extra: dict[str, Any] | None = None,
     ) -> ChatCompletionResult:
+        # NOTE: `temperature` is intentionally NOT sent by default:
+        # - GPT-5 reasoning mode (reasoning_effort != "none") rejects temperature/top_p/logprobs.
+        # - even for non-reasoning calls, we prefer to keep sampling policy external and explicit.
+        _ = float(temperature)
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": float(temperature),
         }
+        if self.reasoning_effort != "none":
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            payload["verbosity"] = self.verbosity
         if extra:
             payload.update(extra)
+
+        # If reasoning_effort was set via `extra`, apply the same safety rule.
+        try:
+            effective_effort = str(payload.get("reasoning_effort") or "none").strip().lower()
+        except Exception:
+            effective_effort = "none"
+        if effective_effort != "none":
+            # OpenAI hard constraint: these knobs are mutually exclusive with non-none reasoning_effort.
+            for k in ("temperature", "top_p", "logprobs"):
+                payload.pop(k, None)
+
         if bool(self.enable_thinking):
             # OpenAI SDK supports passing non-standard provider params via `extra_body`.
             extra_body = payload.get("extra_body")

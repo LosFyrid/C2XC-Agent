@@ -100,6 +100,8 @@ def create_app() -> FastAPI:
             return {
                 "OPENAI_API_BASE": os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL") or "",
                 "LLM_MODEL": os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "",
+                "C2XC_LLM_REASONING_EFFORT": os.getenv("C2XC_LLM_REASONING_EFFORT") or "",
+                "C2XC_LLM_VERBOSITY": os.getenv("C2XC_LLM_VERBOSITY") or "",
                 "C2XC_EMBEDDING_API_BASE": os.getenv("C2XC_EMBEDDING_API_BASE") or os.getenv("EMBEDDING_API_BASE") or "",
                 "C2XC_EMBEDDING_MODEL": os.getenv("C2XC_EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL") or "",
                 "C2XC_EMBEDDING_DIM": os.getenv("C2XC_EMBEDDING_DIM") or os.getenv("EMBEDDING_DIM") or "",

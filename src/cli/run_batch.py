@@ -41,7 +41,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--temperature",
         type=float,
         default=0.7,
-        help="Sampling temperature (diversity comes only from sampling params).",
+        help=(
+            "Legacy sampling temperature (kept for trace/replay metadata). "
+            "NOTE: when using reasoning_effort!=none (e.g. GPT-5), temperature is not sent to the API."
+        ),
     )
     parser.add_argument(
         "--db-path",
@@ -97,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
             "kb_principles_dir": os.getenv("LIGHTRAG_KB_PRINCIPLES_DIR", ""),
             "kb_modulation_dir": os.getenv("LIGHTRAG_KB_MODULATION_DIR", ""),
             "llm_model": os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "")),
+            "llm_reasoning_effort": os.getenv("C2XC_LLM_REASONING_EFFORT", ""),
+            "llm_verbosity": os.getenv("C2XC_LLM_VERBOSITY", ""),
             "openai_api_base": os.getenv("OPENAI_API_BASE", os.getenv("OPENAI_BASE_URL", "")),
             "rb_llm_model": os.getenv("C2XC_RB_LEARN_LLM_MODEL", ""),
             "rb_openai_api_base": os.getenv("C2XC_RB_LEARN_OPENAI_API_BASE", ""),

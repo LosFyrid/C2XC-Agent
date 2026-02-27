@@ -23,7 +23,13 @@ class CreateBatchRequest(BaseModel):
     user_request: str = Field(default="", description="User request text. If empty, backend may choose a default.")
     n_runs: int = Field(default=1, ge=1)
     recipes_per_run: int = Field(default=3, ge=1)
-    temperature: float = Field(default=0.7)
+    temperature: float = Field(
+        default=0.7,
+        description=(
+            "Legacy sampling temperature (stored in trace/config_snapshot for compatibility). "
+            "When llm_reasoning_effort!=none (e.g. GPT-5 reasoning), temperature is not sent to the API."
+        ),
+    )
     dry_run: bool = Field(default=False)
     overrides: dict[str, Any] = Field(default_factory=dict)
     schema_version: int = Field(default=1)
@@ -188,6 +194,12 @@ def create_batch(
                 overrides.get("kb_modulation_dir") or os.getenv("LIGHTRAG_KB_MODULATION_DIR", "")
             ),
             "llm_model": str(overrides.get("llm_model") or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or ""),
+            "llm_reasoning_effort": str(
+                overrides.get("llm_reasoning_effort")
+                or os.getenv("C2XC_LLM_REASONING_EFFORT")
+                or ""
+            ),
+            "llm_verbosity": str(overrides.get("llm_verbosity") or os.getenv("C2XC_LLM_VERBOSITY") or ""),
             "openai_api_base": str(
                 overrides.get("openai_api_base")
                 or os.getenv("OPENAI_API_BASE")

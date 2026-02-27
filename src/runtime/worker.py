@@ -161,10 +161,18 @@ class RunWorker:
         # RB learn LLM config: prefer rb_* overrides, fall back to main run config.
         run_llm_model = str(config_snapshot.get("llm_model") or overrides.get("llm_model") or "").strip()
         run_openai_api_base = str(config_snapshot.get("openai_api_base") or overrides.get("openai_api_base") or "").strip()
+        run_llm_reasoning_effort = str(
+            config_snapshot.get("llm_reasoning_effort") or overrides.get("llm_reasoning_effort") or ""
+        ).strip()
+        run_llm_verbosity = str(config_snapshot.get("llm_verbosity") or overrides.get("llm_verbosity") or "").strip()
         rb_llm_model = str(config_snapshot.get("rb_llm_model") or overrides.get("rb_llm_model") or "").strip() or run_llm_model
         rb_openai_api_base = str(config_snapshot.get("rb_openai_api_base") or overrides.get("rb_openai_api_base") or "").strip() or run_openai_api_base
         if rb_llm_model:
             env_overrides["LLM_MODEL"] = rb_llm_model
+        if run_llm_reasoning_effort:
+            env_overrides["C2XC_LLM_REASONING_EFFORT"] = run_llm_reasoning_effort
+        if run_llm_verbosity:
+            env_overrides["C2XC_LLM_VERBOSITY"] = run_llm_verbosity
         if rb_openai_api_base:
             env_overrides["OPENAI_API_BASE"] = rb_openai_api_base
 
@@ -176,6 +184,8 @@ class RunWorker:
                 "rb_job_id": rb_job_id,
                 "kind": kind,
                 "llm_model": rb_llm_model,
+                "llm_reasoning_effort": run_llm_reasoning_effort,
+                "llm_verbosity": run_llm_verbosity,
                 "openai_api_base": rb_openai_api_base,
                 "embedding_model": embedding_model,
                 "embedding_api_base": embedding_api_base,
@@ -304,6 +314,10 @@ class RunWorker:
                 config_snapshot.get("kb_modulation_dir") or overrides.get("kb_modulation_dir") or ""
             ).strip()
             llm_model = str(config_snapshot.get("llm_model") or overrides.get("llm_model") or "").strip()
+            llm_reasoning_effort = str(
+                config_snapshot.get("llm_reasoning_effort") or overrides.get("llm_reasoning_effort") or ""
+            ).strip()
+            llm_verbosity = str(config_snapshot.get("llm_verbosity") or overrides.get("llm_verbosity") or "").strip()
             openai_api_base = str(
                 config_snapshot.get("openai_api_base") or overrides.get("openai_api_base") or ""
             ).strip()
@@ -321,6 +335,10 @@ class RunWorker:
                 env_overrides["LIGHTRAG_KB_MODULATION_DIR"] = kb_modulation_dir
             if llm_model:
                 env_overrides["LLM_MODEL"] = llm_model
+            if llm_reasoning_effort:
+                env_overrides["C2XC_LLM_REASONING_EFFORT"] = llm_reasoning_effort
+            if llm_verbosity:
+                env_overrides["C2XC_LLM_VERBOSITY"] = llm_verbosity
             if openai_api_base:
                 env_overrides["OPENAI_API_BASE"] = openai_api_base
             if embedding_model:
