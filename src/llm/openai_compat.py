@@ -18,7 +18,7 @@ class ChatCompletionResult:
 
 
 class OpenAICompatibleChatClient:
-    """Minimal OpenAI-compatible chat client wrapper.
+    """Minimal OpenAI-compatible LLM client wrapper.
 
     We keep this small on purpose:
     - user will swap providers/models via OpenAI-compatible gateways
@@ -123,30 +123,137 @@ class OpenAICompatibleChatClient:
         temperature: float,
         extra: dict[str, Any] | None = None,
     ) -> ChatCompletionResult:
-        # NOTE: `temperature` is intentionally NOT sent by default:
-        # - GPT-5 reasoning mode (reasoning_effort != "none") rejects temperature/top_p/logprobs.
-        # - even for non-reasoning calls, we prefer to keep sampling policy external and explicit.
+        # Responses API migration:
+        # - Use `/v1/responses` instead of `/v1/chat/completions` for GPT-5.* style reasoning models.
+        # - Keep the public signature stable (`messages`, `temperature`, `extra`) so the rest of the
+        #   codebase (ReCAP engine + RB learn) doesn't need to change.
+        # - `temperature` is now a legacy/trace-only knob. When reasoning is enabled, OpenAI rejects
+        #   temperature/top_p/logprobs anyway. We intentionally do NOT send temperature by default.
         _ = float(temperature)
+
+        extra = dict(extra or {})
+
+        def _chat_response_format_to_text_format(rf: Any) -> dict[str, Any] | None:
+            if not isinstance(rf, dict):
+                return None
+            rftype = str(rf.get("type") or "").strip()
+            if rftype == "json_schema":
+                js = rf.get("json_schema")
+                if not isinstance(js, dict):
+                    return None
+                name = str(js.get("name") or "").strip()
+                schema = js.get("schema")
+                if not name or not isinstance(schema, dict):
+                    return None
+                strict = js.get("strict")
+                return {
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": schema,
+                    "strict": bool(strict) if strict is not None else None,
+                }
+            if rftype == "json_object":
+                return {"type": "json_object"}
+            if rftype == "text":
+                return {"type": "text"}
+            return None
+
+        def _messages_to_responses_input(
+            msgs: list[dict[str, Any]],
+        ) -> tuple[str | None, list[dict[str, Any]]]:
+            """Translate Chat Completions-style messages into Responses API `instructions` + `input` items.
+
+            Supports:
+            - role=system/user/assistant/developer messages (as easy message inputs)
+            - role=tool messages (as function_call_output items)
+            - assistant tool calls embedded as `tool_calls` (as function_call items)
+            """
+            instructions: str | None = None
+            items: list[dict[str, Any]] = []
+
+            for i, m in enumerate(msgs):
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role") or "").strip()
+                content = m.get("content")
+                content_str = str(content or "")
+
+                # Prefer Responses `instructions` for the leading system prompt.
+                if i == 0 and role == "system":
+                    instructions = content_str
+                    continue
+
+                if role in {"system", "developer", "user", "assistant"}:
+                    items.append({"type": "message", "role": role, "content": content_str})
+
+                    # If this assistant message contains tool calls, emit explicit function_call items
+                    # so later tool outputs can reference the call_id.
+                    if role == "assistant" and isinstance(m.get("tool_calls"), list):
+                        for tc in m.get("tool_calls") or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            call_id = str(tc.get("id") or "").strip()
+                            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                            name = str((fn or {}).get("name") or "").strip()
+                            args = (fn or {}).get("arguments") if isinstance(fn, dict) else ""
+                            args_str = args if isinstance(args, str) else str(args or "")
+                            if not call_id or not name:
+                                continue
+                            items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": args_str,
+                                }
+                            )
+                    continue
+
+                if role == "tool":
+                    call_id = str(m.get("tool_call_id") or "").strip()
+                    if not call_id:
+                        # Tool outputs without a call id are not representable in Responses API.
+                        continue
+                    items.append({"type": "function_call_output", "call_id": call_id, "output": content_str})
+                    continue
+
+            return instructions, items
+
+        instructions, input_items = _messages_to_responses_input(messages)
+
+        # Translate chat.completions `response_format` into responses `text.format`.
+        response_format = extra.pop("response_format", None)
+        text_format = _chat_response_format_to_text_format(response_format)
+
+        text_cfg: dict[str, Any] = {}
+        if text_format is not None:
+            # Drop `strict=None` to keep payload minimal.
+            if text_format.get("type") == "json_schema" and text_format.get("strict") is None:
+                text_format = {k: v for k, v in text_format.items() if k != "strict"}
+            text_cfg["format"] = text_format
+        if self.verbosity is not None:
+            text_cfg["verbosity"] = self.verbosity
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "input": input_items,
+            **extra,
         }
+        if instructions is not None:
+            payload["instructions"] = instructions
+        if bool(text_cfg):
+            payload["text"] = text_cfg
         if self.reasoning_effort != "none":
-            payload["reasoning_effort"] = self.reasoning_effort
-        if self.verbosity is not None:
-            payload["verbosity"] = self.verbosity
-        if extra:
-            payload.update(extra)
+            payload["reasoning"] = {"effort": self.reasoning_effort}
 
-        # If reasoning_effort was set via `extra`, apply the same safety rule.
+        # Safety: if callers manually set a non-none reasoning effort, ensure sampling knobs are removed.
         try:
-            effective_effort = str(payload.get("reasoning_effort") or "none").strip().lower()
+            reasoning_obj = payload.get("reasoning")
+            effective_effort = str((reasoning_obj or {}).get("effort") or "none").strip().lower() if isinstance(reasoning_obj, dict) else "none"
         except Exception:
             effective_effort = "none"
         if effective_effort != "none":
-            # OpenAI hard constraint: these knobs are mutually exclusive with non-none reasoning_effort.
-            for k in ("temperature", "top_p", "logprobs"):
+            for k in ("temperature", "top_p", "logprobs", "top_logprobs"):
                 payload.pop(k, None)
 
         if bool(self.enable_thinking):
@@ -156,59 +263,45 @@ class OpenAICompatibleChatClient:
                 payload["extra_body"] = {**extra_body, "enable_thinking": True}
             else:
                 payload["extra_body"] = {"enable_thinking": True}
-        resp = self._client.chat.completions.create(**payload)
-        raw = resp.model_dump()
-        msg = resp.choices[0].message
-        content = (msg.content or "").strip()
 
+        resp = self._client.responses.create(**payload)
+        raw = resp.model_dump()
+        content = str(getattr(resp, "output_text", "") or "").strip()
+
+        # Surface reasoning summaries for trace/debugging only (not required for core logic).
         reasoning_content: str | None = None
         try:
-            rc = getattr(msg, "reasoning_content", None)
-            if isinstance(rc, str) and rc.strip():
-                reasoning_content = rc.strip()
+            summaries: list[str] = []
+            for item in getattr(resp, "output", []) or []:
+                if getattr(item, "type", None) != "reasoning":
+                    continue
+                for s in getattr(item, "summary", []) or []:
+                    text = str(getattr(s, "text", "") or "").strip()
+                    if text:
+                        summaries.append(text)
+            if summaries:
+                reasoning_content = "\n".join(summaries).strip()
         except Exception:
             reasoning_content = None
-        if reasoning_content is None:
-            # Extremely defensive: some OpenAI-compatible gateways surface this only as an extra field.
-            try:
-                m_extra = getattr(msg, "model_extra", None)
-                if isinstance(m_extra, dict):
-                    rc2 = m_extra.get("reasoning_content")
-                    if isinstance(rc2, str) and rc2.strip():
-                        reasoning_content = rc2.strip()
-            except Exception:
-                pass
-        if reasoning_content is None:
-            try:
-                choices = raw.get("choices") if isinstance(raw, dict) else None
-                if isinstance(choices, list) and choices:
-                    m = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else None
-                    if isinstance(m, dict):
-                        rc3 = m.get("reasoning_content")
-                        if isinstance(rc3, str) and rc3.strip():
-                            reasoning_content = rc3.strip()
-            except Exception:
-                pass
 
         tool_calls: list[dict[str, Any]] = []
-        if getattr(msg, "tool_calls", None):
-            tool_calls = [tc.model_dump() for tc in (msg.tool_calls or [])]
-        elif getattr(msg, "function_call", None):
-            fc = msg.function_call
-            tool_calls = [
-                {
-                    "id": "legacy_function_call",
-                    "type": "function",
-                    "function": {
-                        "name": getattr(fc, "name", None),
-                        "arguments": getattr(fc, "arguments", ""),
-                    },
-                }
-            ]
+        try:
+            for item in getattr(resp, "output", []) or []:
+                if getattr(item, "type", None) != "function_call":
+                    continue
+                call_id = str(getattr(item, "call_id", "") or "").strip()
+                name = str(getattr(item, "name", "") or "").strip()
+                arguments = str(getattr(item, "arguments", "") or "")
+                if not call_id or not name:
+                    continue
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                )
+        except Exception:
+            tool_calls = []
 
-        return ChatCompletionResult(
-            content=content,
-            reasoning_content=reasoning_content,
-            raw=raw,
-            tool_calls=tool_calls,
-        )
+        return ChatCompletionResult(content=content, raw=raw, tool_calls=tool_calls, reasoning_content=reasoning_content)
