@@ -2,6 +2,21 @@
 
 This project currently has no tagged releases. Version labels below follow commit messages and milestone naming.
 
+## v0.3.0 (2026-02-27)
+
+- Changed: Switch primary agent LLM calls from Chat Completions (`/v1/chat/completions`) to the Responses API (`/v1/responses`) via the OpenAI SDK.
+  - Keeps internal call sites stable (`messages` + `tools` + `tool_choice` + chat-style `response_format`) by translating them into Responses `instructions` + `input` + `text.format`.
+  - Tool calls are surfaced via Responses `function_call` items; tool outputs are sent back as `function_call_output` items.
+- Note: LightRAG (KB) still uses Chat Completions internally (unchanged).
+- Risk: Requires an endpoint that supports `/v1/responses` (some OpenAI-compatible gateways may not).
+
+## v0.2.8 (2026-02-27)
+
+- New: GPT-5 reasoning controls:
+  - `C2XC_LLM_REASONING_EFFORT` (`none|minimal|low|medium|high|xhigh`)
+  - `C2XC_LLM_VERBOSITY` (`low|medium|high`)
+- Changed: `temperature` is treated as a legacy/trace-only knob and is not sent to the API when reasoning is enabled.
+
 ## v0.2.6 (2026-01-19)
 
 - Fixed: RB learn format-fix flow no longer crashes with `UnboundLocalError: fix_prompt` when extractor outputs pass validation (or when issues are not detected).

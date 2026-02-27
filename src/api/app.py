@@ -70,7 +70,7 @@ def create_app() -> FastAPI:
             if worker is not None:
                 worker.stop()
 
-    app = FastAPI(title="C2XC-Agent API", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="C2XC-Agent API", version="0.3.0", lifespan=lifespan)
 
     app.add_exception_handler(APIError, api_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
