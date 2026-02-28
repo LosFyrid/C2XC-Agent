@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -264,9 +265,119 @@ class OpenAICompatibleChatClient:
             else:
                 payload["extra_body"] = {"enable_thinking": True}
 
+        def _extract_assistant_message_texts(raw_resp: dict[str, Any]) -> list[str]:
+            """Extract assistant message texts from a Responses API `model_dump()` dict.
+
+            Responses can contain multiple `output` message items. For structured outputs
+            (json_object/json_schema), some models/gateways emit multiple JSON objects as
+            separate assistant messages, which must NOT be concatenated.
+            """
+            out: list[str] = []
+            for item in raw_resp.get("output") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "") != "message":
+                    continue
+                if str(item.get("role") or "") != "assistant":
+                    continue
+                content_any = item.get("content")
+                # Typical shape: content=[{"type":"output_text","text":"..."}]
+                if isinstance(content_any, list):
+                    buf: list[str] = []
+                    for part in content_any:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = str(part.get("type") or "")
+                        if ptype in {"output_text", "text"}:
+                            t = str(part.get("text") or "")
+                            if t:
+                                buf.append(t)
+                    s = "".join(buf).strip()
+                    if s:
+                        out.append(s)
+                    continue
+                # Fallback: treat as plain string.
+                s2 = str(content_any or "").strip()
+                if s2:
+                    out.append(s2)
+            return out
+
+        def _choose_best_structured_message(
+            *,
+            texts: list[str],
+            response_format_obj: Any,
+        ) -> str:
+            """Pick the single best JSON object message to return as `content`.
+
+            Chat Completions returns one assistant message; Responses may return many.
+            Our callers expect exactly one JSON object for structured outputs.
+            """
+
+            def _parse_obj(s: str) -> dict[str, Any] | None:
+                s2 = (s or "").strip()
+                if not (s2.startswith("{") and s2.endswith("}")):
+                    return None
+                try:
+                    v = json.loads(s2)
+                except Exception:
+                    return None
+                return v if isinstance(v, dict) else None
+
+            # If we know the schema name, we can apply a stronger preference.
+            schema_name: str | None = None
+            if isinstance(response_format_obj, dict) and str(response_format_obj.get("type") or "") == "json_schema":
+                js = response_format_obj.get("json_schema")
+                if isinstance(js, dict):
+                    schema_name = str(js.get("name") or "").strip() or None
+
+            expected_key_sets: list[set[str]] = []
+            if schema_name == "recap_response":
+                expected_key_sets.append({"think", "subtasks"})
+            elif schema_name == "generate_recipes_output":
+                expected_key_sets.append({"recipes"})
+            elif schema_name == "rb_extract_items":
+                expected_key_sets.append({"items"})
+            elif schema_name == "rb_merge_result":
+                expected_key_sets.append({"content"})
+
+            parsed: list[tuple[str, dict[str, Any]]] = []
+            for t in texts:
+                obj = _parse_obj(t)
+                if obj is not None:
+                    parsed.append((t, obj))
+
+            if not parsed:
+                # Best-effort: return the first non-empty text.
+                for t in texts:
+                    if (t or "").strip():
+                        return str(t).strip()
+                return ""
+
+            for keys in expected_key_sets:
+                for t, obj in parsed:
+                    if keys.issubset(set(obj.keys())):
+                        return t.strip()
+
+            # Generic structured-output heuristics (covers json_object mode).
+            for keys in ({"think", "subtasks"}, {"recipes"}, {"items"}, {"content"}):
+                for t, obj in parsed:
+                    if keys.issubset(set(obj.keys())):
+                        return t.strip()
+
+            # Fall back to the longest JSON object payload.
+            best_t, _ = max(parsed, key=lambda x: len(x[0]))
+            return best_t.strip()
+
         resp = self._client.responses.create(**payload)
         raw = resp.model_dump()
-        content = str(getattr(resp, "output_text", "") or "").strip()
+
+        assistant_texts = _extract_assistant_message_texts(raw)
+        # If we requested structured output, do NOT concatenate multiple assistant messages.
+        if text_format is not None and str(text_format.get("type") or "") in {"json_schema", "json_object"}:
+            content = _choose_best_structured_message(texts=assistant_texts, response_format_obj=response_format)
+        else:
+            # Non-structured mode: best-effort concatenate.
+            content = "\n\n".join([t for t in assistant_texts if (t or "").strip()]).strip()
 
         # Surface reasoning summaries for trace/debugging only (not required for core logic).
         reasoning_content: str | None = None
