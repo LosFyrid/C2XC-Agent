@@ -1054,7 +1054,11 @@ class RecapEngine:
                 )
                 plan_extra: dict[str, Any] = {}
                 if not bool(getattr(ctx.llm, "enable_thinking", False)):
-                    plan_extra = {"response_format": _RECAP_RESPONSE_FORMAT}
+                    # Responses API (and many OpenAI-compatible gateways) reject JSON Schemas that contain
+                    # union constructs like oneOf/anyOf. Our ReCAP planner schema uses oneOf to model
+                    # multiple subtask variants, so we use JSON-object mode here and rely on our own
+                    # strict parser/validator (_parse_subtask) to enforce the contract.
+                    plan_extra = {"response_format": {"type": "json_object"}}
                 raw = ctx.llm.chat_messages(
                     messages=messages,
                     temperature=ctx.temperature,

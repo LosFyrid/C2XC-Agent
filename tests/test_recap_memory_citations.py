@@ -43,7 +43,10 @@ class _FakeLLM:
         # ReCAP planning/refinement calls.
         rf = extra.get("response_format") or {}
         schema_name = ((rf.get("json_schema") or {}) if isinstance(rf, dict) else {}).get("name")
-        if schema_name == "recap_response":
+        # ReCAP planner used to rely on a strict json_schema ("recap_response"), but Responses API
+        # rejects union constructs like oneOf. The engine now uses json_object mode for planning.
+        rf_type = str(rf.get("type") or "").strip() if isinstance(rf, dict) else ""
+        if schema_name == "recap_response" or rf_type == "json_object":
             # Determine which role we are currently acting as from the injected role instructions.
             # (The engine uses a shared chat history but injects role instructions into the user prompt.)
             prompt = str((messages[-1] or {}).get("content") or "")
