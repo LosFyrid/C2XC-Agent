@@ -1225,7 +1225,25 @@ class RecapEngine:
                         )
                         return parsed_root, citations, resolved_mem_ids
                     except Exception as e:
-                        raise RecapError("Root task ended without generate_recipes.") from e
+                        # Recovery path: instead of failing the entire run, treat this as an actionable
+                        # observation and force the orchestrator to call generate_recipes (preferred),
+                        # or to output a final JSON object that passes validation.
+                        rt.latest_obs = (
+                            "ERROR: Root task ended with subtasks=[] but WITHOUT calling generate_recipes, "
+                            "and the fallback `result` did not pass final-output validation.\n\n"
+                            f"Validation error: {e}\n\n"
+                            "To proceed (choose ONE):\n"
+                            "1) Preferred: return ReCAP JSON with subtasks=[{\"type\":\"generate_recipes\"}] "
+                            "and an empty result.\n"
+                            "2) If you keep subtasks=[], your result MUST be the final output JSON with:\n"
+                            "   - recipes: array of exactly recipes_per_run items\n"
+                            "   - each recipe contains M1, M2, atomic_ratio, small_molecule_modifier, rationale\n"
+                            "   - each recipe.rationale contains at least one inline citation: [C#], [P#], or mem:<uuid>\n"
+                            "Return ONLY a single valid ReCAP JSON object. No extra text."
+                        ).strip()
+                        rt.remaining_subtasks = [{"type": "generate_recipes"}]
+                        rt.state = RecapState.ACTION_TAKEN
+                        continue
 
                 rt.done_task_name = rt.node_ptr.task_name
                 rt.done_task_result = info.result.strip()
