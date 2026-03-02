@@ -159,6 +159,66 @@ class OpenAICompatibleChatClient:
                 return {"type": "text"}
             return None
 
+        def _chat_tools_to_responses_tools(tools_any: Any) -> Any:
+            """Translate Chat Completions tool definitions into Responses API tool definitions.
+
+            Chat Completions style:
+              {"type":"function","function":{"name":..., "description":..., "parameters":...}}
+            Responses API expects:
+              {"type":"function","name":..., "description":..., "parameters":...}
+            """
+            if not isinstance(tools_any, list):
+                return tools_any
+
+            out: list[dict[str, Any]] = []
+            for t in tools_any:
+                if not isinstance(t, dict):
+                    continue
+                typ = str(t.get("type") or "").strip()
+                if typ != "function":
+                    # Best-effort passthrough for non-function tools (if any).
+                    out.append(t)
+                    continue
+
+                # Already in Responses format.
+                name = t.get("name")
+                if isinstance(name, str) and name.strip():
+                    out.append(t)
+                    continue
+
+                fn = t.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                fn_name = fn.get("name")
+                if not isinstance(fn_name, str) or not fn_name.strip():
+                    continue
+                desc = fn.get("description")
+                params = fn.get("parameters")
+                out.append(
+                    {
+                        "type": "function",
+                        "name": fn_name.strip(),
+                        "description": str(desc or "").strip(),
+                        "parameters": params if isinstance(params, dict) else {},
+                    }
+                )
+            return out
+
+        def _chat_tool_choice_to_responses_tool_choice(choice_any: Any) -> Any:
+            # Pass through common string values.
+            if isinstance(choice_any, str):
+                return choice_any
+            # Chat: {"type":"function","function":{"name":"..."}}
+            if isinstance(choice_any, dict):
+                typ = str(choice_any.get("type") or "").strip()
+                if typ == "function":
+                    fn = choice_any.get("function")
+                    if isinstance(fn, dict):
+                        name = fn.get("name")
+                        if isinstance(name, str) and name.strip():
+                            return {"type": "function", "name": name.strip()}
+            return choice_any
+
         def _messages_to_responses_input(
             msgs: list[dict[str, Any]],
         ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -225,6 +285,12 @@ class OpenAICompatibleChatClient:
         # Translate chat.completions `response_format` into responses `text.format`.
         response_format = extra.pop("response_format", None)
         text_format = _chat_response_format_to_text_format(response_format)
+
+        # Translate tool definitions / tool_choice when callers pass Chat Completions-shaped payloads.
+        if "tools" in extra:
+            extra["tools"] = _chat_tools_to_responses_tools(extra.get("tools"))
+        if "tool_choice" in extra:
+            extra["tool_choice"] = _chat_tool_choice_to_responses_tool_choice(extra.get("tool_choice"))
 
         text_cfg: dict[str, Any] = {}
         if text_format is not None:
