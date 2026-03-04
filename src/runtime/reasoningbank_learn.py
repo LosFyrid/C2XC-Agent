@@ -1223,7 +1223,9 @@ def _extractor_response_format() -> dict[str, Any]:
                                 "content": {"type": "string", "minLength": 1},
                                 "extra": {"type": "object"},
                             },
-                            "required": ["role", "type", "content"],
+                            # OpenAI Structured Outputs (strict=true) requires that `required` includes
+                            # *every* key in `properties`. Keep `extra` required but allow empty objects.
+                            "required": ["role", "type", "content", "extra"],
                         },
                     },
                     "verdicts": {
@@ -1237,11 +1239,13 @@ def _extractor_response_format() -> dict[str, Any]:
                                 "verdict": {"type": "string", "enum": ["support", "contradict", "irrelevant"]},
                                 "notes": {"type": "string"},
                             },
-                            "required": ["mem_id", "claim_id", "verdict"],
+                            # Keep `notes` required but allow empty strings.
+                            "required": ["mem_id", "claim_id", "verdict", "notes"],
                         },
                     },
                 },
-                "required": ["items"],
+                # Keep `verdicts` required but allow empty arrays.
+                "required": ["items", "verdicts"],
             },
         },
     }
@@ -1260,7 +1264,9 @@ def _merge_response_format() -> dict[str, Any]:
                     "content": {"type": "string", "minLength": 1},
                     "extra": {"type": "object"},
                 },
-                "required": ["content"],
+                # OpenAI Structured Outputs (strict=true) requires `required` to include *every* key.
+                # Keep `extra` required but allow empty objects.
+                "required": ["content", "extra"],
             },
         },
     }

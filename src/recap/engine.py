@@ -199,7 +199,9 @@ def _recipes_response_format(*, recipes_per_run: int) -> dict[str, Any]:
             },
             "overall_notes": {"type": "string"},
         },
-        "required": ["recipes"],
+        # OpenAI Structured Outputs (strict=true) requires that `required` includes *every* key in `properties`.
+        # Keep `overall_notes` required but allow empty strings (no minLength) so callers can ignore it.
+        "required": ["recipes", "overall_notes"],
     }
 
     return {
